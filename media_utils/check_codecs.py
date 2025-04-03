@@ -2,47 +2,56 @@ import os
 
 import cv2
 
-# チェックしたいFourCCコードのリスト
-fourcc_codes = ["DIVX", "XVID", "MJPG", "mp4v", "FMP4"]  # 他にも試したいものがあれば追加
 
-# ダミーのファイル名と設定
-dummy_filename = "test_codec.avi"  # コーデックによっては拡張子を .avi や .mp4 にする必要があるかも
-fps = 30
-width = 640
-height = 480
+def check_available_codecs(fourcc_codes=None):
+    """指定された FourCC コードリストについて、OpenCV の VideoWriter で利用可能かチェックします。
 
-print("Checking available VideoWriter codecs for OpenCV...")
+    一時ファイルを作成して VideoWriter を初期化し、isOpened() の結果を確認します。
 
-available_codecs = []
-unavailable_codecs = []
+    :param fourcc_codes: チェックする FourCC コードの文字列リスト (例: ["DIVX", "XVID"])。
+                         None の場合はデフォルトのリストを使用します。
+    :type fourcc_codes: list[str] | None
+    :return: 利用可能なコーデックと利用不可能なコーデックのリストを含む辞書。
+             {'available': [...], 'unavailable': [...]}
+    :rtype: dict
+    """
+    if fourcc_codes is None:
+        fourcc_codes = ["DIVX", "XVID", "MJPG", "mp4v", "FMP4"]
 
-for code in fourcc_codes:
-    fourcc = cv2.VideoWriter_fourcc(*code)
-    writer = cv2.VideoWriter(dummy_filename, fourcc, fps, (width, height))
+    # 一時ファイル名 (カレントディレクトリに作成)
+    dummy_filename = "test_codec.avi"
+    fps = 30
+    width = 640
+    height = 480
 
-    if writer.isOpened():
-        print(f"'{code}' seems AVAILABLE.")
-        available_codecs.append(code)
-        writer.release()  # すぐに解放
-    else:
-        print(f"'{code}' seems UNAVAILABLE.")
-        unavailable_codecs.append(code)
-        # writer.release() は isOpened() が False なら不要
+    available_codecs = []
+    unavailable_codecs = []
 
-# ダミーファイルを削除
-if os.path.exists(dummy_filename):
-    try:
-        os.remove(dummy_filename)
-    except Exception as e:
-        print(f"Note: Could not remove dummy file {dummy_filename}: {e}")
+    print("Checking codec availability...")
+    for code in fourcc_codes:
+        print(f"  Testing: {code}", end="... ")
+        try:
+            fourcc = cv2.VideoWriter_fourcc(*code)  # type: ignore
+            writer = cv2.VideoWriter(dummy_filename, fourcc, fps, (width, height))
 
-print("\n--- Summary ---")
-print(f"Available: {available_codecs}")
-print(f"Unavailable (or failed to initialize): {unavailable_codecs}")
+            if writer.isOpened():
+                print("Available")
+                available_codecs.append(code)
+                writer.release()
+            else:
+                print("Unavailable")
+                unavailable_codecs.append(code)
+        except Exception as e:
+            # VideoWriter_fourcc や VideoWriter で例外が発生した場合も Unavailable とする
+            print(f"Error testing {code}: {e}")
+            unavailable_codecs.append(code)
 
-if "DIVX" not in available_codecs and "XVID" not in available_codecs:
-    print("\nNote: DIVX/XVID codecs might not be installed or accessible by OpenCV.")
-    print(
-        "Consider installing a codec pack like K-Lite Codec Pack (Basic version is usually sufficient),"
-    )
-    print("or trying other codecs like 'MJPG'.")
+    # ダミーファイルを削除
+    if os.path.exists(dummy_filename):
+        try:
+            os.remove(dummy_filename)
+            print(f"Removed temporary file: {dummy_filename}")
+        except Exception as e:
+            print(f"Warning: Failed to remove temporary file {dummy_filename}: {e}")
+
+    return {"available": available_codecs, "unavailable": unavailable_codecs}
