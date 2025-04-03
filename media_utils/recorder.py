@@ -76,6 +76,7 @@ FFmpeg の呼び出しには標準ライブラリの `subprocess` を使用し�
 * coverage (テスト用)
 """
 
+import logging
 import os
 import queue
 import subprocess
@@ -87,6 +88,9 @@ import numpy as np
 import pyautogui
 import sounddevice as sd
 import soundfile as sf
+
+# --- ロガー設定 ---
+logger = logging.getLogger(__name__)
 
 # 注意: このモジュールは共有のaudio_queueとstop_eventの管理のためにapp.pyに依存しています。
 # 将来的にはクラスベースのアプローチでこれをより良くカプセル化できるかもしれません。
@@ -135,10 +139,10 @@ class AudioConverter:
                                              (終了コードが 0 以外の場合)
         """
         if not os.path.exists(wav_path) or os.path.getsize(wav_path) <= 1024:
-            print(f"オーディオ変換をスキップ: WAVファイルが存在しないか空です: {wav_path}")
+            logger.info(f"オーディオ変換をスキップ: WAVファイルが存在しないか空です: {wav_path}")
             return False
 
-        print(
+        logger.info(
             f"--- FFmpeg --- {wav_path} から {mp3_path} への変換を開始します (ビットレート: {bitrate})"
         )
         ffmpeg_command = [
@@ -155,7 +159,7 @@ class AudioConverter:
         ]
         success = False
         try:
-            print(f"FFmpegコマンドを実行: {' '.join(ffmpeg_command)}")
+            logger.debug(f"FFmpegコマンドを実行: {' '.join(ffmpeg_command)}")
             startupinfo = None
             if os.name == "nt":
                 startupinfo = subprocess.STARTUPINFO()
@@ -168,32 +172,32 @@ class AudioConverter:
                 text=True,
                 startupinfo=startupinfo,
             )
-            print("FFmpegによるWAVからMP3への変換が成功しました！")
+            logger.info("FFmpegによるWAVからMP3への変換が成功しました！")
             success = True
             if self.cleanup_temp_files:
-                try:
+            try:
                     os.remove(wav_path)
-                    print(f"一時的なオーディオファイルを削除しました: {wav_path}")
-                except OSError as e:
-                    print(f"一時的なオーディオファイル {wav_path} の削除中にエラー: {e}")
+                    logger.info(f"一時的なオーディオファイルを削除しました: {wav_path}")
+            except OSError as e:
+                    logger.warning(f"一時的なオーディオファイル {wav_path} の削除中にエラー: {e}")
             else:
-                print(f"一時ファイル削除スキップ: {wav_path}")
+                logger.info(f"一時ファイル削除スキップ: {wav_path}")
 
         except subprocess.CalledProcessError as e:
-            print("!!!!!!!! FFmpegによるWAVからMP3への変換が失敗しました !!!!!!!!")
-            print(f"コマンド: {' '.join(e.cmd)}")
-            print(f"リターンコード: {e.returncode}")
-            print(f"エラー出力 (stderr):\n{e.stderr}")
+            logger.error("!!!!!!!! FFmpegによるWAVからMP3への変換が失敗しました !!!!!!!!")
+            logger.error(f"コマンド: {' '.join(e.cmd)}")
+            logger.error(f"リターンコード: {e.returncode}")
+            logger.error(f"エラー出力 (stderr):\n{e.stderr}")
         except FileNotFoundError:
-            print(f"エラー: '{self.ffmpeg_path}' コマンドが見つかりません。")
+            logger.error(f"エラー: '{self.ffmpeg_path}' コマンドが見つかりません。")
         except Exception as e:
-            print(f"FFmpeg変換中に予期せぬエラーが発生しました: {e}")
+            logger.exception(f"FFmpeg変換中に予期せぬエラーが発生しました: {e}")
         finally:
             if not success and not self.cleanup_temp_files:
-                print("変換失敗のため、一時的なWAVファイルは削除されませんでした。")
+                logger.warning("変換失敗のため、一時的なWAVファイルは削除されませんでした。")
             elif not success and self.cleanup_temp_files:
                 # cleanup_temp_files=True でも失敗時は削除しない方がデバッグしやすいかも
-                print("変換失敗のため、一時的なWAVファイルは削除されませんでした。")
+                logger.warning("変換失敗のため、一時的なWAVファイルは削除されませんでした。")
 
         return success
 
@@ -321,9 +325,7 @@ class Recorder:
         :type status: sounddevice.CallbackFlags
         """
         if status:
-            # エラーや警告など、何らかのステータス情報があれば表示
             print(status, flush=True)
-        # 受け取ったデータをコピーしてキューに入れる (非同期処理のため)
         self.audio_queue.put(indata.copy())
 
     def _audio_record(self):
@@ -338,16 +340,18 @@ class Recorder:
         :raises ValueError: 指定された `audio_device_index` やパラメータが無効な場合。
         :raises Exception: その他の予期せぬエラー (ファイル書き込みエラーなど)。
         """
-        print(f"オーディオ録音開始: {self.audio_filename_temp}")
+        logger.info(f"オーディオ録音開始: {self.audio_filename_temp}")
         try:
             device_info = sd.query_devices(self.audio_device_index, "input")
-            print(f"選択されたデバイス情報: {device_info.get('name', 'N/A')}")  # type: ignore
+            logger.debug(f"選択されたデバイス情報: {device_info.get('name', 'N/A')}")  # type: ignore
             actual_samplerate = int(device_info.get("default_samplerate", 0))  # type: ignore
             actual_channels = int(device_info.get("max_input_channels", 0))  # type: ignore
-            print(
+            logger.debug(
                 f"デバイスがサポートするサンプルレート: {actual_samplerate}, 最大チャンネル数: {actual_channels}"
             )
-            print(f"使用するサンプルレート: {self.samplerate}, チャンネル数: {self.channels}")
+            logger.debug(
+                f"使用するサンプルレート: {self.samplerate}, チャンネル数: {self.channels}"
+            )
 
             # soundfile で一時 WAV ファイルを開く (追記ではなく新規作成: mode='xb')
             with sf.SoundFile(
@@ -376,15 +380,17 @@ class Recorder:
                             # キューが空でも stop_event をチェックするためループ継続
                             pass
         except sd.PortAudioError as e:
-            print(f"デバイス {self.audio_device_index} の選択時にPortAudioエラーが発生: {e}")
+            logger.error(f"デバイス {self.audio_device_index} の選択時にPortAudioエラーが発生: {e}")
         except ValueError as e:
-            print(f"無効なデバイスインデックス {self.audio_device_index} またはパラメータ: {e}")
+            logger.error(
+                f"無効なデバイスインデックス {self.audio_device_index} またはパラメータ: {e}"
+            )
         except Exception as e:
             # ファイルオープン失敗などもここに含まれる可能性
-            print(f"オーディオ録音エラー: {e}")
+            logger.exception(f"オーディオ録音エラー: {e}")
         finally:
             # 正常終了、エラー発生に関わらず最後に実行
-            print(f"オーディオ録音停止: {self.audio_filename_temp}")
+            logger.info(f"オーディオ録音停止: {self.audio_filename_temp}")
 
     def _resize_and_pad_frame(self, frame, target_size, shorts_format):
         """キャプチャしたフレームを指定された出力サイズに合わせてリサイズ・パディングする内部メソッド。
@@ -493,7 +499,7 @@ class Recorder:
                 # VideoWriter を開けなかった場合は IOError を発生
                 raise IOError(f"ビデオライターを {video_filename} に対して開けませんでした")
 
-            print(f"ビデオ録画開始: {video_filename}")
+            logger.info(f"ビデオ録画開始: {video_filename}")
             start_time = time.time()
             # duration=0 なら無限大 (inf) に設定し、stop_event でのみ停止するように
             end_time = start_time + self.duration if self.duration > 0 else float("inf")
@@ -523,14 +529,14 @@ class Recorder:
             self.video_success = True
 
         except Exception as e:
-            print(f"ビデオ録画エラー: {e}")
+            logger.exception(f"ビデオ録画エラー: {e}")
             # エラー発生時は stop_event をセットしてオーディオスレッドも停止させる
             self.stop()
         finally:
             # 正常終了、エラー発生に関わらず VideoWriter を解放
             if out and out.isOpened():
                 out.release()
-            print(f"ビデオ録画停止: {video_filename}")
+            logger.info(f"ビデオ録画停止: {video_filename}")
 
     def _process_output(self):
         """録画停止後の後処理を実行する内部メソッド。
@@ -554,24 +560,26 @@ class Recorder:
             self.audio_filename_temp, mp3_output_filename
         )
         if conversion_success:
-            print(f"オーディオ変換成功。 {mp3_output_filename} を確認してください。")
+            logger.info(f"オーディオ変換成功。 {mp3_output_filename} を確認してください。")
         else:
             # スキップまたは失敗した場合
-            print("オーディオ変換に失敗またはスキップされました。")
+            logger.warning("オーディオ変換に失敗またはスキップされました。")
 
         # 一時的なビデオファイルのクリーンアップ (変換成否に関わらず実行)
         if os.path.exists(self.video_filename_temp):
             try:
                 os.remove(self.video_filename_temp)
-                print(
+                logger.info(
                     f"未使用の一時的なビデオファイルをクリーンアップしました: {self.video_filename_temp}"
                 )
             except OSError as e:
-                print(
+                logger.warning(
                     f"一時的なビデオファイル {self.video_filename_temp} のクリーンアップ中にエラー: {e}"
                 )
 
-        print(f"オーディオテストプロセスが完了しました。{mp3_output_filename} を確認してください。")
+        logger.info(
+            f"オーディオテストプロセスが完了しました。{mp3_output_filename} を確認してください。"
+        )
 
         # --- === TODO: オリジナルのマージロジックを復元 === ---
         # if self.video_success and conversion_success: # conversion_success はマージ処理に置き換わる
@@ -612,7 +620,7 @@ class Recorder:
         5. オーディオスレッドの終了を待ちます (タイムアウト付き)。
         6. `_process_output` を呼び出して後処理を実行します。
         """
-        print("レコーダー開始中...")
+        logger.info("レコーダー開始中...")
         self.stop_event.clear()
 
         # オーディオ録音スレッドの準備と開始
@@ -629,17 +637,17 @@ class Recorder:
         # オーディオスレッドがキューの書き込みを終えるのを待つ
         # is_alive() チェックは必須 (既に終了している場合があるため)
         if self.audio_recording_thread and self.audio_recording_thread.is_alive():
-            print("オーディオスレッドが終了するのを待機中...")
+            logger.debug("オーディオスレッドが終了するのを待機中...")
             # join() でスレッドの終了を待つ。タイムアウトを設定。
             self.audio_recording_thread.join(timeout=5.0)
             # タイムアウト後もまだ生きていたら警告表示
             if self.audio_recording_thread.is_alive():
-                print("警告: オーディオスレッドの結合がタイムアウトしました。")
+                logger.warning("警告: オーディオスレッドの結合がタイムアウトしました。")
 
         # 後処理（音声変換、一時ファイル削除、将来的にはマージ）を実行
         self._process_output()
 
-        print("レコーダーが終了しました。")
+        logger.info("レコーダーが終了しました。")
 
     def stop(self):
         """現在実行中の録画プロセスに対して停止を要求します。
@@ -648,5 +656,5 @@ class Recorder:
         これにより、`_audio_record` と `_screen_record` のループが停止します。
         実際の停止処理は `start` メソッドの呼び出しが完了する際に行われます。
         """
-        print("レコーダーの停止が通知されました。")
+        logger.info("レコーダーの停止が通知されました。")
         self.stop_event.set()

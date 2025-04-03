@@ -1,7 +1,10 @@
 import datetime
+import json
+import logging
 import os
 import queue
 import threading
+import traceback
 
 import pyautogui
 import sounddevice as sd
@@ -9,6 +12,9 @@ from flask import Flask, jsonify, render_template, request, send_from_directory
 
 # Import the Recorder class
 from media_utils.recorder import Recorder
+
+# --- ロギング設定 ---
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 
 app = Flask(__name__)
 
@@ -30,37 +36,255 @@ stop_event = threading.Event()
 # Variables to track current operation for status endpoint
 current_status_info = {"final_output": None}
 
+
+# --- ヘルパークラス定義 ---
+class RecordingRequestHandler:
+    """/start_recording のリクエスト処理ロジックをカプセル化するクラス"""
+
+    def __init__(self, request_data, app_config):
+        """初期化
+
+        :param request_data: Flaskリクエストから取得したJSONデータ (辞書)
+        :param app_config: Flaskアプリケーションの設定オブジェクト (app.config)
+        """
+        self.data = request_data if request_data is not None else {}
+        self.config = app_config
+        # 処理結果を格納するインスタンス変数
+        self.duration = None
+        self.fps = None
+        self.shorts_format = None
+        self.region_enabled = None
+        self.region = None
+        self.temp_video_file = None
+        self.temp_audio_file = None
+        self.output_filename = None
+        self.samplerate = None
+        self.channels = None
+        self.selected_device_index = None
+
+    def validate_parameters(self):
+        """リクエストパラメータの存在、型、妥当性を検証する。"""
+        logging.debug("Validating request parameters...")
+        required_keys = ["duration", "fps", "shorts_format", "region_enabled"]
+        missing_keys = [key for key in required_keys if key not in self.data]
+        if missing_keys:
+            raise ValueError(f"必須パラメータが不足しています: {', '.join(missing_keys)}")
+
+        try:
+            self.duration = int(self.data["duration"])
+            self.fps = int(self.data["fps"])
+        except (ValueError, TypeError):
+            raise ValueError("duration と fps は整数である必要があります")
+        try:
+            sf_val = self.data["shorts_format"]
+            re_val = self.data["region_enabled"]
+            if not isinstance(sf_val, bool):
+                logging.warning(
+                    f"shorts_format should be boolean, got {type(sf_val)}. Attempting conversion."
+                )
+            if not isinstance(re_val, bool):
+                logging.warning(
+                    f"region_enabled should be boolean, got {type(re_val)}. Attempting conversion."
+                )
+            self.shorts_format = bool(sf_val)
+            self.region_enabled = bool(re_val)
+        except Exception as e:
+            raise ValueError(f"shorts_format/region_enabled の解釈中にエラー: {e}")
+
+        logging.debug(
+            f"Validated base parameters: duration={self.duration}, fps={self.fps}, shorts={self.shorts_format}, region_enabled={self.region_enabled}"
+        )
+
+        if self.region_enabled:
+            region_keys = ["left", "top", "width", "height"]
+            missing_region_keys = [key for key in region_keys if key not in self.data]
+            if missing_region_keys:
+                raise ValueError(
+                    f"region_enabled が true の場合、必須パラメータが不足しています: {', '.join(missing_region_keys)}"
+                )
+            try:
+                left = int(self.data["left"])
+                top = int(self.data["top"])
+                width = int(self.data["width"])
+                height = int(self.data["height"])
+            except (ValueError, TypeError):
+                raise ValueError("left, top, width, height は整数である必要があります")
+
+            logging.debug(f"Requested region: L={left}, T={top}, W={width}, H={height}")
+            if width <= 0 or height <= 0:
+                raise ValueError("領域の幅と高さは正の値である必要があります")
+
+            screen_width, screen_height = pyautogui.size()
+            if left < 0 or top < 0 or left + width > screen_width or top + height > screen_height:
+                logging.warning(
+                    f"Region adjusted: was ({left},{top},{width},{height}), screen is ({screen_width},{screen_height})"
+                )
+                left = max(0, left)
+                top = max(0, top)
+                width = min(width, screen_width - left)
+                height = min(height, screen_height - top)
+                if width <= 0 or height <= 0:
+                    raise ValueError("調整後、画面内に有効な録画領域がありません")
+            self.region = (left, top, width, height)
+            logging.debug(f"Final region: {self.region}")
+        else:
+            self.region = None
+            logging.debug("Region recording disabled.")
+
+    def generate_filenames(self):
+        """タイムスタンプに基づき、一時ファイル名と最終出力ファイル名を生成する。"""
+        logging.debug("Generating filenames...")
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_filename = f"screen_recording_{timestamp}"
+        self.temp_video_file = os.path.join(self.config["TEMP_FOLDER"], f"{base_filename}_temp.avi")
+        self.temp_audio_file = os.path.join(self.config["TEMP_FOLDER"], f"{base_filename}_temp.wav")
+        self.output_filename = os.path.join(
+            self.config["RECORDINGS_FOLDER"], f"{base_filename}.mp4"
+        )
+        logging.debug(
+            f"Generated filenames: TempVideo={self.temp_video_file}, TempAudio={self.temp_audio_file}, Output={self.output_filename}"
+        )
+
+    def determine_audio_settings(self):
+        """オーディオデバイスをクエリし、録音に使用する設定を決定する。"""
+        logging.debug("Determining audio settings...")
+        target_device_index = 10  # Stereo Mix を優先試行
+        self.samplerate = Recorder.DEFAULT_SAMPLERATE
+        self.channels = Recorder.DEFAULT_CHANNELS
+        self.selected_device_index = None
+        try:
+            logging.debug(f"Attempting to query target device: {target_device_index}")
+            device_info = sd.query_devices(target_device_index, "input")
+            logging.debug(f"Target device info raw: {device_info}")
+            self.samplerate = int(device_info.get("default_samplerate", Recorder.DEFAULT_SAMPLERATE))  # type: ignore
+            self.channels = 1 if device_info.get("max_input_channels", 0) >= 1 else 0  # type: ignore
+            self.selected_device_index = target_device_index
+            device_name = device_info.get("name", f"Device {target_device_index}")  # type: ignore
+            logging.info(
+                f"Using target device ({device_name}) with {self.samplerate} Hz, {self.channels} channels."
+            )
+        except (ValueError, sd.PortAudioError) as e:
+            logging.warning(
+                f"Could not use target device ({target_device_index}): {e}. Falling back to default."
+            )
+            try:
+                logging.debug("Attempting to query default input device...")
+                default_device_info = sd.query_devices(kind="input")
+                logging.debug(f"Default device info raw: {default_device_info}")
+                self.samplerate = int(default_device_info.get("default_samplerate", Recorder.DEFAULT_SAMPLERATE))  # type: ignore
+                self.channels = 1 if default_device_info.get("max_input_channels", 0) >= 1 else 0  # type: ignore
+                self.selected_device_index = None
+                default_device_name = default_device_info.get("name", "Unknown Default Device")  # type: ignore
+                logging.info(
+                    f"Using default input ({default_device_name}) with {self.samplerate} Hz, {self.channels} channels."
+                )
+            except Exception as e_fallback:
+                logging.error(
+                    f"Could not query default input: {e_fallback}. Using hardcoded defaults."
+                )
+                self.samplerate = Recorder.DEFAULT_SAMPLERATE
+                self.channels = Recorder.DEFAULT_CHANNELS
+                self.selected_device_index = None
+                logging.warning(
+                    f"Using hardcoded default audio settings: {self.samplerate} Hz, {self.channels} channels."
+                )
+
+    def prepare_recorder_args(self):
+        """Recorderクラスの初期化に必要な引数を辞書として返す。"""
+        logging.debug("Preparing Recorder arguments...")
+        if not all(
+            [
+                self.duration is not None,
+                self.fps is not None,
+                self.shorts_format is not None,
+                self.region_enabled is not None,
+            ]
+        ):
+            raise ValueError(
+                "パラメータが検証されていません。validate_parameters() を先に呼び出してください。"
+            )
+        if not all([self.temp_video_file, self.temp_audio_file, self.output_filename]):
+            raise ValueError(
+                "ファイル名が生成されていません。generate_filenames() を先に呼び出してください。"
+            )
+        if self.samplerate is None or self.channels is None:
+            raise ValueError(
+                "オーディオ設定が決定されていません。determine_audio_settings() を先に呼び出してください。"
+            )
+
+        recorder_args = {
+            "video_filename_temp": self.temp_video_file,
+            "audio_filename_temp": self.temp_audio_file,
+            "output_filename_final": self.output_filename,
+            "stop_event_ref": stop_event,
+            "duration": self.duration,
+            "fps": self.fps,
+            "region": self.region,
+            "shorts_format": self.shorts_format,
+            "samplerate": self.samplerate,
+            "channels": self.channels,
+            "audio_device_index": self.selected_device_index,
+            "ffmpeg_path": self.config["FFMPEG_PATH"],
+        }
+        logging.debug(f"Recorder args prepared: {recorder_args}")
+        return recorder_args
+
+
 # --- Flask Routes ---
 
 
 @app.route("/")
 def index():
+    logging.info("Checking for leftover temp files...")
     # Clean up leftover temp files
     for folder in [app.config["TEMP_FOLDER"], app.config["RECORDINGS_FOLDER"]]:
-        if not os.path.isdir(folder):
+        if not os.path.exists(folder):
+            logging.debug(f"Folder not found, skipping cleanup: {folder}")
             continue
-        for f in os.listdir(folder):
-            # Clean temp AVI/WAV or potentially failed MP3 tests
-            if f.startswith("screen_recording_") and (
-                f.endswith(".avi") or f.endswith(".wav") or f.endswith(".mp3")
-            ):
-                try:
-                    os.remove(os.path.join(folder, f))
-                    print(f"Removed leftover temp/test file: {f}")
-                except OSError as e:
-                    print(f"Error removing leftover file {f}: {e}")
+        if not os.path.isdir(folder):
+            logging.warning(f"Path is not a directory, skipping cleanup: {folder}")
+            continue
+
+        logging.debug(f"Checking folder: {folder}")
+        try:
+            for f in os.listdir(folder):
+                file_path = os.path.join(folder, f)
+                # ファイルのみを対象とするチェックを追加
+                if not os.path.isfile(file_path):
+                    continue
+
+                # Clean temp AVI/WAV or potentially failed MP3 tests
+                if f.startswith("screen_recording_") and (
+                    f.lower().endswith(".avi")
+                    or f.lower().endswith(".wav")
+                    or f.lower().endswith(".mp3")
+                ):
+                    try:
+                        os.remove(file_path)
+                        logging.info(f"Removed leftover temp/test file: {f} in {folder}")
+                    except OSError as e:
+                        # 削除エラーは警告としてログに残す
+                        logging.warning(f"Error removing leftover file {f} in {folder}: {e}")
+        except Exception as e:
+            # listdir 自体のエラーなど
+            logging.error(f"Error during cleanup for folder {folder}: {e}")
+
     return render_template("index.html")
 
 
 @app.route("/start_recording", methods=["POST"])
 def start_recording_route():
+    """録画開始リクエストを処理するエンドポイントハンドラ。"""
     global main_recording_thread, recording, stop_event, recorder_instance, current_status_info
+    logging.debug("Received /start_recording request")
 
     if recording:
+        logging.warning("Recording already in progress")
         return jsonify({"status": "error", "message": "すでに録画中です"})
 
     data = request.json
-    if not data:
+    if data is None:  # 空のボディも None になる場合があるため明示的にチェック
+        logging.error("Request body is null or not JSON")
         return (
             jsonify(
                 {"status": "error", "message": "リクエストボディが空か、JSON形式ではありません。"}
@@ -69,126 +293,52 @@ def start_recording_route():
         )
 
     try:
-        duration = int(data.get("duration", 30))
-        fps = int(data.get("fps", 30))
-        shorts_format = data.get("shorts_format", True)
-        region_enabled = data.get("region_enabled", False)
-        region = None
+        # --- リファクタリング: ヘルパークラスを利用 ---
+        handler = RecordingRequestHandler(data, app.config)
+        handler.validate_parameters()  # 1. パラメータ検証
+        handler.generate_filenames()  # 2. ファイル名生成
+        handler.determine_audio_settings()  # 3. オーディオ設定決定
+        recorder_args = handler.prepare_recorder_args()  # 4. Recorder 引数準備
 
-        # --- Generate Filenames ---
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        base_filename = f"screen_recording_{timestamp}"
-        temp_video_file = os.path.join(app.config["TEMP_FOLDER"], f"{base_filename}_temp.avi")
-        temp_audio_file = os.path.join(app.config["TEMP_FOLDER"], f"{base_filename}_temp.wav")
-        # Output filename for Recorder (will be MP3 in test mode)
-        output_filename = os.path.join(
-            app.config["RECORDINGS_FOLDER"], f"{base_filename}.mp4"
-        )  # Intended final name
-
-        # --- Setup Recording Region ---
-        if region_enabled:
-            left = int(data.get("left", 0))
-            top = int(data.get("top", 0))
-            width = int(data.get("width", 800))
-            height = int(data.get("height", 600))
-            if width <= 0 or height <= 0:
-                raise ValueError("幅と高さは正の値")
-            screen_width, screen_height = pyautogui.size()
-            if left < 0 or top < 0 or left + width > screen_width or top + height > screen_height:
-                print(
-                    f"警告: 領域({left},{top},{width},{height})が画面({screen_width},{screen_height})外. 調整します."
-                )
-                left = max(0, left)
-                top = max(0, top)
-                width = min(width, screen_width - left)
-                height = min(height, screen_height - top)
-                if width <= 0 or height <= 0:
-                    raise ValueError("画面内に有効な録画領域がありません")
-            region = (left, top, width, height)
-
-        # --- Determine Audio Settings ---
-        target_device_index = 10  # Try Stereo Mix first
-        samplerate = Recorder.DEFAULT_SAMPLERATE
-        channels = Recorder.DEFAULT_CHANNELS
-        selected_device_index = None  # Store the actually used device index
-        try:
-            device_info = sd.query_devices(target_device_index, "input")
-            samplerate = int(device_info.get("default_samplerate", Recorder.DEFAULT_SAMPLERATE))  # type: ignore
-            channels = (
-                1 if device_info.get("max_input_channels", 0) >= 1 else 0  # type: ignore
-            )  # .get() に合わせて 0 をデフォルトに
-            selected_device_index = target_device_index
-            device_name = device_info.get("name", f"Device {target_device_index}")  # type: ignore
-            print(f"Using {device_name} with {samplerate} Hz, {channels} channels.")
-        except (ValueError, sd.PortAudioError) as e:
-            print(
-                f"Could not use target device ({target_device_index}): {e}. Falling back to default."
-            )
-            try:
-                default_device_info = sd.query_devices(kind="input")
-                samplerate = int(default_device_info.get("default_samplerate", Recorder.DEFAULT_SAMPLERATE))  # type: ignore
-                channels = (
-                    1
-                    if default_device_info.get("max_input_channels", 0) >= 1  # type: ignore
-                    else 0
-                )
-                selected_device_index = None  # Indicate default device
-                default_device_name = default_device_info.get("name", "Unknown Default Device")  # type: ignore
-                print(
-                    f"Using default input ({default_device_name}) with {samplerate} Hz, {channels} channels."
-                )
-            except Exception as e_fallback:
-                print(f"Could not query default input: {e_fallback}. Using hardcoded defaults.")
-                samplerate = Recorder.DEFAULT_SAMPLERATE
-                channels = Recorder.DEFAULT_CHANNELS
-                selected_device_index = None
-                print(
-                    f"Using default input (Unknown Default Device) with {samplerate} Hz, {channels} channels."
-                )
-
-        # --- Create Recorder instance and Start Thread ---
-        recording = True  # Set recording state
+        # --- アプリケーションの状態を更新 ---
+        logging.debug("Setting application state to recording...")
+        recording = True
         stop_event.clear()
-        current_status_info["final_output"] = output_filename  # Store intended final name
+        current_status_info["final_output"] = handler.output_filename  # type: ignore
+        logging.debug(f"Final output filename set in status: {handler.output_filename}")
 
-        recorder_instance = Recorder(
-            video_filename_temp=temp_video_file,
-            audio_filename_temp=temp_audio_file,
-            output_filename_final=output_filename,  # Pass intended final name
-            stop_event_ref=stop_event,  # Pass the shared event
-            duration=duration,
-            fps=fps,
-            region=region,
-            shorts_format=shorts_format,
-            samplerate=samplerate,
-            channels=channels,
-            audio_device_index=selected_device_index,
-            ffmpeg_path=app.config["FFMPEG_PATH"],
-        )
+        # --- Recorder インスタンス作成とスレッド開始 ---
+        logging.debug("Creating Recorder instance...")
+        recorder_instance = Recorder(**recorder_args)
+        logging.debug("Recorder instance created.")
 
+        logging.debug("Creating and starting recording thread...")
         main_recording_thread = threading.Thread(
-            target=run_recording_process,  # Wrapper function
+            target=run_recording_process,
             args=(recorder_instance,),
             daemon=True,
         )
         main_recording_thread.start()
+        # --- 修正: basename の引数が None でないことを確認 (より安全に) ---
+        output_basename = (
+            os.path.basename(handler.output_filename) if handler.output_filename else "unknown_file"
+        )
+        logging.info(f"Recording started successfully: {output_basename}")
 
         return jsonify(
             {
                 "status": "success",
-                "message": f"録画を開始しました ({os.path.basename(output_filename)})",
+                "message": f"録画を開始しました ({output_basename})",
             }
         )
 
     except ValueError as e:
-        recording = False  # Reset state on error
-        return jsonify({"status": "error", "message": f"設定エラー: {str(e)}"}), 400
+        logging.error(f"Parameter validation error: {e}")
+        recording = False
+        return jsonify({"status": "error", "message": f"パラメータエラー: {str(e)}"}), 400
     except Exception as e:
-        recording = False  # Reset state on error
-        print(f"録画開始処理中の予期せぬエラー: {e}")
-        import traceback
-
-        traceback.print_exc()
+        logging.exception(f"Unexpected error during start_recording: {e}")
+        recording = False
         return jsonify({"status": "error", "message": f"録画開始エラー: {str(e)}"}), 500
 
 
@@ -198,15 +348,14 @@ def run_recording_process(recorder):
     try:
         recorder.start()
     except Exception as e:
-        print(f"Error during recording process thread: {e}")
+        logging.exception(f"Error during recording process thread: {e}")
         if recorder and recorder.stop_event:
             recorder.stop_event.set()
     finally:
-        print("Recording thread finished, resetting state.")
+        logging.info("Recording thread finished, resetting state.")
         recording = False
         recorder_instance = None  # Clear instance
         current_status_info["final_output"] = None
-        # stop_event.clear() # No need to clear here, cleared on next start
 
 
 @app.route("/stop_recording", methods=["POST"])
@@ -216,11 +365,9 @@ def stop_recording_route():
     if not recording or recorder_instance is None:
         return jsonify({"status": "error", "message": "録画していません"})
 
-    print("Stop recording request received. Signaling recorder...")
-    # Use the recorder's stop method (which sets the event)
+    logging.info("Stop recording request received. Signaling recorder...")
     recorder_instance.stop()
 
-    # The thread's finally block will reset the main `recording` flag
     return jsonify({"status": "success", "message": "録画停止リクエストを送信しました"})
 
 
@@ -243,12 +390,11 @@ def get_status():
 @app.route("/recordings", methods=["GET"])
 def list_recordings():
     try:
-        # List final MP4/MP3 files from the RECORDINGS_FOLDER
         recordings_dir = app.config["RECORDINGS_FOLDER"]
         files = [
             f
             for f in os.listdir(recordings_dir)
-            if (f.endswith(".mp4") or f.endswith(".mp3"))
+            if (f.lower().endswith(".mp4") or f.lower().endswith(".mp3"))
             and os.path.isfile(os.path.join(recordings_dir, f))
         ]
         files.sort(
@@ -259,7 +405,7 @@ def list_recordings():
     except FileNotFoundError:
         return jsonify({"recordings": [], "message": "録画フォルダが見つかりません。"})
     except Exception as e:
-        print(f"録画リスト取得エラー: {e}")
+        logging.exception(f"録画リスト取得エラー: {e}")
         return (
             jsonify({"recordings": [], "error": "録画リストの取得中にエラーが発生しました。"}),
             500,
@@ -274,7 +420,7 @@ def download_file_route(filename):
     except FileNotFoundError:
         return jsonify({"status": "error", "message": "ファイルが見つかりません。"}), 404
     except Exception as e:
-        print(f"ダウンロードエラー ({filename}): {e}")
+        logging.exception(f"ダウンロードエラー ({filename}): {e}")
         return (
             jsonify({"status": "error", "message": "ダウンロード中にエラーが発生しました。"}),
             500,
@@ -300,7 +446,7 @@ def delete_file_route(filename):
                 404,
             )
     except Exception as e:
-        print(f"削除エラー ({filename}): {e}")
+        logging.exception(f"削除エラー ({filename}): {e}")
         return (
             jsonify(
                 {"status": "error", "message": f"ファイルの削除中にエラーが発生しました: {str(e)}"}

@@ -1,0 +1,10 @@
+[run]
+source =
+    media_utils
+    app
+
+[report]
+# 除外したいファイルやパターンがあれば指定
+# omit =
+#     media_utils/__init__.py
+#     */site-packages/* 

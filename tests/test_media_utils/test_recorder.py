@@ -338,7 +338,7 @@ class TestRecorderAudioRecordMethod:
         # --- テスト実行 ---
         # _audio_record はブロッキングするため別スレッドで実行
         thread = threading.Thread(target=recorder_instance._audio_record)
-        thread.start()
+    thread.start()
 
         # スレッドがキューのデータを処理するのを少し待つ
         time.sleep(0.5)
@@ -661,7 +661,7 @@ class TestRecorderAudioCallbackMethod:
             pytest.fail("キューからデータを取得できませんでした")
 
     @patch("builtins.print")  # print 関数をモック
-    def test_audio_callback_prints_status(self, mock_print, recorder_instance):
+    def test_audio_callback_prints_status(self, mock_print, recorder_instance):  # 引数に mock_print
         """_audio_callback が status を print することを確認"""
         dummy_indata = np.array([[0.1]], dtype=np.float32)
         frames = len(dummy_indata)
@@ -671,5 +671,5 @@ class TestRecorderAudioCallbackMethod:
         # --- テスト実行 ---
         recorder_instance._audio_callback(dummy_indata, frames, current_time, test_status)
 
-        # --- 検証 ---
+        # --- 修正: print が呼ばれたことを検証 ---
         mock_print.assert_called_once_with(test_status, flush=True)

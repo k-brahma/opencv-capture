@@ -1,3 +1,21 @@
+"""
+media_utils.check_codecs - OpenCV で利用可能なビデオコーデックを確認するユーティリティ
+=============================================================================
+
+このモジュールは、指定された FourCC コードに対応するビデオコーデックが、
+現在の環境の OpenCV (`cv2.VideoWriter`) で利用可能かどうかをチェックする関数
+`check_available_codecs` を提供します。
+
+一時的な AVI ファイルを作成しようとすることで、コーデックの初期化成否を確認します。
+
+使用例 (スクリプトとして実行する場合):
+-------------------------------------
+
+>>> from media_utils import check_codecs
+>>> check_codecs.check_available_codecs()
+{'available': ['DIVX', 'XVID', 'MJPG', 'mp4v', 'FMP4'], 'unavailable': []}
+"""
+
 import os
 
 import cv2
@@ -42,7 +60,6 @@ def check_available_codecs(fourcc_codes=None):
                 print("Unavailable")
                 unavailable_codecs.append(code)
         except Exception as e:
-            # VideoWriter_fourcc や VideoWriter で例外が発生した場合も Unavailable とする
             print(f"Error testing {code}: {e}")
             unavailable_codecs.append(code)
 
@@ -50,7 +67,7 @@ def check_available_codecs(fourcc_codes=None):
     if os.path.exists(dummy_filename):
         try:
             os.remove(dummy_filename)
-            print(f"Removed temporary file: {dummy_filename}")
+            # print(f"Removed temporary file: {dummy_filename}")
         except Exception as e:
             print(f"Warning: Failed to remove temporary file {dummy_filename}: {e}")
 

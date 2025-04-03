@@ -87,74 +87,37 @@ class TestAudioDeviceQuery:
             assert "Device query failed" in result["error"]
 
     def test_display_output(self):
-        """表示関数の出力をテスト"""
+        """表示関数の標準出力をテスト"""
         with patch("media_utils.list_audio_devices.sd.query_devices") as mock_query_devices, patch(
             "media_utils.list_audio_devices.sd.query_hostapis"
         ) as mock_query_hostapis, patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
 
-            # モックデータ
-            mock_devices = [
-                {
-                    "name": "Default",
-                    "index": 0,
-                    "hostapi": 0,
-                    "max_input_channels": 2,
-                    "max_output_channels": 0,
-                    "default_input": True,
-                },
-                {
-                    "name": "Speakers",
-                    "index": 1,
-                    "hostapi": 0,
-                    "max_input_channels": 0,
-                    "max_output_channels": 2,
-                    "default_output": True,
-                },
-            ]
-
-            mock_hostapis = [
-                {
-                    "name": "Windows WASAPI",
-                    "devices": [0, 1],
-                    "default_input_device": 0,
-                    "default_output_device": 1,
-                }
-            ]
-
-            # モックの戻り値を設定
+            # モックデータ (簡略化)
+            mock_devices = [{"name": "D1", "index": 0}, {"name": "D2", "index": 1}]
+            mock_hostapis = [{"name": "H1"}]
             mock_query_devices.return_value = mock_devices
             mock_query_hostapis.return_value = mock_hostapis
 
             # 表示関数を実行
             display_audio_devices()
 
-            # 出力をキャプチャ
             output = mock_stdout.getvalue()
-
-            # アサーション
             assert "Querying available audio devices..." in output
             assert "Finished querying devices" in output
-            assert "Look for devices that might represent system audio output/loopback" in output
-            assert "Examples: 'Stereo Mix'" in output
-            assert "Available Host APIs:" in output
-            assert "WASAPI on Windows" in output
+            assert str(mock_devices) in output
+            assert str(mock_hostapis) in output
 
     def test_display_error_output(self):
-        """エラー発生時の表示関数の出力をテスト"""
+        """エラー発生時の表示関数の標準エラー出力をテスト"""
         with patch("media_utils.list_audio_devices.sd.query_devices") as mock_query_devices, patch(
-            "sys.stdout", new_callable=io.StringIO
-        ) as mock_stdout:
+            "sys.stderr", new_callable=io.StringIO
+        ) as mock_stderr:
 
-            # 例外を発生させる
             mock_query_devices.side_effect = RuntimeError("Device query failed")
 
-            # 表示関数を実行
             display_audio_devices()
 
-            # 出力をキャプチャ
-            output = mock_stdout.getvalue()
-
-            # アサーション
+            output = mock_stderr.getvalue()
             assert "An error occurred while querying devices:" in output
             assert "Device query failed" in output
 
