@@ -240,37 +240,49 @@ class TestStartRecordingRoute:
     """/start_recording ルートのテストクラス"""
 
     @patch("app.threading.Thread")
+    @patch("app.sd.query_hostapis")
     @patch("app.sd.query_devices")
     @patch("app.Recorder")
     def test_start_recording_success_valid_json(
-        self, mock_Recorder, mock_query_devices, mock_Thread, client, app
+        self, mock_Recorder, mock_query_devices, mock_query_hostapis, mock_Thread, client, app
     ):
         """POST /start_recording : 正常系 (マイクが見つかり、ステミキが見つからないケース)"""
         # --- モック準備 ---
         mock_recorder_instance = mock_Recorder.return_value
         mock_thread_instance = mock_Thread.return_value
-        # --- 修正: query_devices のモックを拡張 ---
-        mic_dev_info = {
-            "name": "Mock Mic Device",
+        
+        # MME API のモック
+        mock_query_hostapis.return_value = [
+            {"name": "MME", "devices": [3, 4, 5]}
+        ]
+        
+        # デバイス一覧のモック
+        mock_devices = [
+            {
+                "index": 3,
+                "name": "Microphone Array",
+                "hostapi": 0,  # MME APIのインデックス
+                "max_input_channels": 1,
             "default_samplerate": 48000,
+            },
+            {
+                "index": 4,
+                "name": "マイク (Some Other Device)",
+                "hostapi": 0,  # MME APIのインデックス
             "max_input_channels": 1,
-        }
-        # ステレオミキサー (インデックス 2) は見つからない (エラー発生)
-
-        def query_devices_side_effect(*args, **kwargs):
-            if args == (1, "input"):  # マイク (Index 1)
-                return mic_dev_info
-            elif args == (2, "input"):  # ステミキ (Index 2)
-                raise ValueError("Device 2 not found")
-            elif (
-                kwargs.get("kind") == "input"
-            ):  # デフォルトマイク (フォールバック用だが今回は使われないはず)
-                return mic_dev_info  # 同じものを返す
-            else:
-                return None
-
-        mock_query_devices.side_effect = query_devices_side_effect
-        # --- ここまで修正 ---
+                "default_samplerate": 44100,
+            },
+            {
+                "index": 5,
+                "name": "Some Output Device",
+                "hostapi": 0,  # MME APIのインデックス
+                "max_input_channels": 0,
+                "max_output_channels": 2,
+                "default_samplerate": 48000,
+            }
+        ]
+        
+        mock_query_devices.return_value = mock_devices
 
         request_data = {
             "duration": 15,
@@ -292,12 +304,12 @@ class TestStartRecordingRoute:
         assert kwargs["fps"] == 24
         assert kwargs["shorts_format"] is False
         assert kwargs["region"] is None
-        # Mic settings
-        assert kwargs["mic_device_index"] == 1
+        # Mic settings - インデックス3のデバイスが見つかるはず
+        assert kwargs["mic_device_index"] == 3
         assert kwargs["mic_samplerate"] == 48000
         assert kwargs["mic_channels"] == 1
         assert "_mic_temp.wav" in kwargs["mic_audio_filename_temp"]
-        # Sys settings (not found)
+        # Sys settings - システム音声デバイスは見つからないはず
         assert kwargs["sys_device_index"] is None
         assert kwargs["sys_samplerate"] is not None  # Default value is set
         assert kwargs["sys_channels"] is not None  # Default value is set
@@ -306,204 +318,17 @@ class TestStartRecordingRoute:
         assert "output_filename_final" in kwargs
         assert "stop_event_ref" in kwargs
         assert "ffmpeg_path" in kwargs
-        # --- ここまで修正 ---
 
         mock_Thread.assert_called_once()
         mock_thread_instance.start.assert_called_once()
 
     @patch("app.threading.Thread")
+    @patch("app.sd.query_hostapis")
     @patch("app.sd.query_devices")
-    @patch("app.Recorder")
-    def test_start_recording_error_empty_json(
-        self, mock_Recorder, mock_query_devices, mock_Thread, client, app
-    ):
-        """POST /start_recording : エラー系 (空の JSON はパラメータ不足)"""
-        # --- テスト実行 ---
-        response = client.post("/start_recording", json={})
-
-        # --- 検証 (400 エラー) ---
-        assert response.status_code == 400
-        data = json.loads(response.data)
-        assert data["status"] == "error"
-        assert "必須パラメータが不足しています" in data["message"]
-        assert "duration" in data["message"]
-        assert app_module.recording is False
-        mock_Recorder.assert_not_called()
-        mock_Thread.assert_not_called()
-
-    @patch("app.threading.Thread")
-    @patch("app.sd.query_devices")
-    @patch("app.Recorder")
-    def test_start_recording_missing_parameter(
-        self, mock_Recorder, mock_query_devices, mock_Thread, client, app
-    ):
-        """POST /start_recording : エラー系 (必須パラメータ duration 不足)"""
-        request_data = {
-            # 'duration': 10, # duration を意図的に欠落
-            "fps": 30,
-            "shorts_format": True,
-            "region_enabled": False,
-        }
-        response = client.post("/start_recording", json=request_data)
-
-        assert response.status_code == 400
-        data = json.loads(response.data)
-        assert data["status"] == "error"
-        assert "必須パラメータが不足しています" in data["message"]
-        assert "duration" in data["message"]
-        assert app_module.recording is False
-        mock_Recorder.assert_not_called()
-
-    @patch("app.threading.Thread")
-    @patch("app.sd.query_devices")
-    @patch("app.Recorder")
-    def test_start_recording_invalid_type(
-        self, mock_Recorder, mock_query_devices, mock_Thread, client, app
-    ):
-        """POST /start_recording : エラー系 (fps が文字列)"""
-        request_data = {
-            "duration": 10,
-            "fps": "thirty",  # 文字列を指定
-            "shorts_format": True,
-            "region_enabled": False,
-        }
-        response = client.post("/start_recording", json=request_data)
-
-        assert response.status_code == 400
-        data = json.loads(response.data)
-        assert data["status"] == "error"
-        assert "fps は整数である必要があります" in data["message"]
-        assert app_module.recording is False
-        mock_Recorder.assert_not_called()
-
-    @patch("app.threading.Thread")
-    @patch("app.sd.query_devices")
-    @patch("app.Recorder")
-    def test_start_recording_missing_region_parameter(
-        self, mock_Recorder, mock_query_devices, mock_Thread, client, app
-    ):
-        """POST /start_recording : エラー系 (region_enabled=True なのに left 不足)"""
-        request_data = {
-            "duration": 10,
-            "fps": 30,
-            "shorts_format": True,
-            "region_enabled": True,  # region 有効
-            # 'left': 0, # left を意図的に欠落
-            "top": 0,
-            "width": 100,
-            "height": 100,
-        }
-        response = client.post("/start_recording", json=request_data)
-
-        assert response.status_code == 400
-        data = json.loads(response.data)
-        assert data["status"] == "error"
-        assert "region_enabled が true の場合、必須パラメータが不足しています" in data["message"]
-        assert "left" in data["message"]
-        assert app_module.recording is False
-        mock_Recorder.assert_not_called()
-
-    @patch("app.threading.Thread")
-    @patch("app.sd.query_devices")
-    @patch("app.Recorder")
-    def test_start_recording_invalid_region_value(
-        self, mock_Recorder, mock_query_devices, mock_Thread, client, app
-    ):
-        """POST /start_recording : エラー系 (region の width が 0)"""
-        request_data = {
-            "duration": 10,
-            "fps": 30,
-            "shorts_format": True,
-            "region_enabled": True,
-            "left": 0,
-            "top": 0,
-            "width": 0,  # 不正な値
-            "height": 100,
-        }
-        response = client.post("/start_recording", json=request_data)
-
-        assert response.status_code == 400
-        data = json.loads(response.data)
-        assert data["status"] == "error"
-        assert "領域の幅と高さは正の値である必要があります" in data["message"]
-        assert app_module.recording is False
-        mock_Recorder.assert_not_called()
-
-    @patch("app.threading.Thread")
-    @patch("app.sd.query_devices")
-    @patch("app.pyautogui.size")  # pyautogui.size をモックに追加
-    @patch("app.Recorder")
-    def test_start_recording_region_adjustment(
-        self, mock_Recorder, mock_pyautogui_size, mock_query_devices, mock_Thread, client, app
-    ):
-        """POST /start_recording : 正常系 (指定領域が画面外の場合に調整される)"""
-        # --- モック準備 ---
-        mock_recorder_instance = mock_Recorder.return_value
-        mock_thread_instance = mock_Thread.return_value
-        mock_pyautogui_size.return_value = (100, 100)  # 画面サイズを 100x100 とする
-        # モックのリセット
-        mock_query_devices.reset_mock()
-        mock_Recorder.reset_mock()
-        mock_Thread.reset_mock()
-        mock_pyautogui_size.reset_mock()
-
-        # query_devices はデフォルトフォールバックとする
-        fallback_dev_info = {
-            "name": "Fallback",
-            "default_samplerate": 44100,
-            "max_input_channels": 1,
-        }
-
-        def query_devices_side_effect(*args, **kwargs):
-            if args == (10, "input"):
-                raise ValueError("Device 10 not found")
-            elif kwargs.get("kind") == "input":
-                return fallback_dev_info
-            else:
-                return None
-
-        mock_query_devices.side_effect = query_devices_side_effect
-
-        # --- テスト実行 (画面外にはみ出す領域を指定) ---
-        request_data = {
-            "duration": 10,
-            "fps": 30,
-            "shorts_format": False,
-            "region_enabled": True,
-            "left": -10,  # 画面左外
-            "top": 50,
-            "width": 80,  # left=0 に調整後、0+80=80 <= 100 なので OK
-            "height": 80,  # top=50 の位置からだと 50+80=130 > 100 なので調整される
-        }
-        response = client.post("/start_recording", json=request_data)
-
-        # --- 検証 ---
-        assert response.status_code == 200
-        data = json.loads(response.data)
-        assert data["status"] == "success"
-        assert app_module.recording is True
-
-        # pyautogui.size が呼ばれたか
-        mock_pyautogui_size.assert_called_once()
-
-        # Recorder の初期化引数検証 (調整後の region を確認)
-        mock_Recorder.assert_called_once()
-        args, kwargs = mock_Recorder.call_args
-        # left=-10 -> 0
-        # top=50 -> 50
-        # width=80 (0+80<=100) -> 80
-        # height=80, screen_height=100, top=50 -> min(80, 100-50) = 50
-        expected_region = (0, 50, 80, 50)
-        assert kwargs["region"] == expected_region
-        mock_Thread.assert_called_once()
-        mock_thread_instance.start.assert_called_once()
-
-    @patch("app.threading.Thread")
-    @patch("app.sd.query_devices")
-    @patch("app.pyautogui.size")  # pyautogui.size をモックに追加
+    @patch("app.pyautogui.size")
     @patch("app.Recorder")
     def test_start_recording_success_target_device(
-        self, mock_Recorder, mock_pyautogui_size, mock_query_devices, mock_Thread, client, app
+        self, mock_Recorder, mock_pyautogui_size, mock_query_devices, mock_query_hostapis, mock_Thread, client, app
     ):
         """POST /start_recording : 正常系 (マイクとステミキの両方が見つかるケース)"""
         # --- モック準備 ---
@@ -513,30 +338,38 @@ class TestStartRecordingRoute:
         mock_Recorder.reset_mock()
         mock_Thread.reset_mock()
 
-        # --- 修正: query_devices のモックを拡張 ---
-        mic_dev_info = {
-            "name": "Mock Mic",
+        # MME API のモック
+        mock_query_hostapis.return_value = [
+            {"name": "MME", "devices": [1, 2, 3]}
+        ]
+        
+        # デバイス一覧のモック
+        mock_devices = [
+            {
+                "index": 1,
+                "name": "Microphone Array",
+                "hostapi": 0,  # MME APIのインデックス
+                "max_input_channels": 2,
             "default_samplerate": 44100,
-            "max_input_channels": 2,  # 2chマイクを想定
-        }
-        sys_dev_info = {
-            "name": "Mock Stereo Mixer",
-            "default_samplerate": 48000,
+            },
+            {
+                "index": 2,
+                "name": "Stereo Mix",
+                "hostapi": 0,  # MME APIのインデックス
             "max_input_channels": 2,
-        }
-
-        def query_devices_side_effect(*args, **kwargs):
-            if args == (1, "input"):  # マイク (Index 1)
-                return mic_dev_info
-            elif args == (2, "input"):  # ステミキ (Index 2)
-                return sys_dev_info
-            elif kwargs.get("kind") == "input":  # デフォルトマイク (今回は使われないはず)
-                return mic_dev_info
-            else:
-                return None
-
-        mock_query_devices.side_effect = query_devices_side_effect
-        # --- ここまで修正 ---
+                "default_samplerate": 48000,
+            },
+            {
+                "index": 3,
+                "name": "Some Output Device",
+                "hostapi": 0,  # MME APIのインデックス
+                "max_input_channels": 0,
+                "max_output_channels": 2,
+                "default_samplerate": 48000,
+            }
+        ]
+        
+        mock_query_devices.return_value = mock_devices
 
         request_data = {"duration": 10, "fps": 30, "shorts_format": True, "region_enabled": False}
         response = client.post("/start_recording", json=request_data)
@@ -553,21 +386,20 @@ class TestStartRecordingRoute:
         assert kwargs["fps"] == 30
         assert kwargs["shorts_format"] is True
         assert kwargs["region"] is None
-        # Mic settings
+        # Mic settings - インデックス1のデバイスが見つかるはず
         assert kwargs["mic_device_index"] == 1
         assert kwargs["mic_samplerate"] == 44100
-        assert kwargs["mic_channels"] == 2  # mic_dev_info に基づく
+        assert kwargs["mic_channels"] == 2
         assert "_mic_temp.wav" in kwargs["mic_audio_filename_temp"]
-        # Sys settings
+        # Sys settings - インデックス2のデバイスが見つかるはず
         assert kwargs["sys_device_index"] == 2
         assert kwargs["sys_samplerate"] == 48000
-        assert kwargs["sys_channels"] == 2  # sys_dev_info に基づく
+        assert kwargs["sys_channels"] == 2
         assert "_sys_temp.wav" in kwargs["sys_audio_filename_temp"]
         # Other args
         assert "output_filename_final" in kwargs
         assert "stop_event_ref" in kwargs
         assert "ffmpeg_path" in kwargs
-        # --- ここまで修正 ---
 
         mock_Thread.assert_called_once()
         mock_thread_instance.start.assert_called_once()

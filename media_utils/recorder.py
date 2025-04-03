@@ -14,7 +14,6 @@ FFmpeg の呼び出しには標準ライブラリの `subprocess` を使用し�
 
 主なクラス
 ----------
-* :class:`AudioConverter`: FFmpeg を使用して音声ファイルを変換するユーティリティクラス。
 * :class:`Recorder`: 画面と音声の録画プロセス全体を管理・実行するメインクラス。
 
 主な機能
@@ -94,8 +93,6 @@ import soundfile as sf
 # --- ロガー設定 ---
 logger = logging.getLogger(__name__)
 
-# --- 削除: AudioConverter は使用しなくなるため削除 ---
-
 
 class Recorder:
     """画面録画と複数音声（マイク、システム）録音のプロセスを管理・実行するクラス。
@@ -168,8 +165,8 @@ class Recorder:
         :type region: tuple[int, int, int, int] | None
         :param shorts_format: ショート動画形式（縦長 9:16、1080x1920）で出力するかどうか。
         :type shorts_format: bool
-        :param ffmpeg_path: FFmpeg 実行可能ファイルへのパス。内部の `AudioConverter` に渡されます。
-        :type ffmpeg_path: str
+        # :param ffmpeg_path: FFmpeg 実行可能ファイルへのパス。内部の `AudioConverter` に渡されます。
+        # :type ffmpeg_path: str
         """
         self.video_filename_temp = video_filename_temp
         self.output_filename_final = output_filename_final

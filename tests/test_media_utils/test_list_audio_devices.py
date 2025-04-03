@@ -92,9 +92,24 @@ class TestAudioDeviceQuery:
             "media_utils.list_audio_devices.sd.query_hostapis"
         ) as mock_query_hostapis, patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
 
-            # モックデータ (簡略化)
-            mock_devices = [{"name": "D1", "index": 0}, {"name": "D2", "index": 1}]
-            mock_hostapis = [{"name": "H1"}]
+            # モックデータを実装に合わせて拡張
+            mock_devices = [
+                {
+                    "name": "Microphone",
+                    "index": 0,
+                    "hostapi": 0,
+                    "max_input_channels": 2,
+                    "max_output_channels": 0,
+                },
+                {
+                    "name": "Stereo Mix",
+                    "index": 1,
+                    "hostapi": 0,
+                    "max_input_channels": 2,
+                    "max_output_channels": 0,
+                }
+            ]
+            mock_hostapis = [{"name": "MME", "index": 0}]
             mock_query_devices.return_value = mock_devices
             mock_query_hostapis.return_value = mock_hostapis
 
@@ -102,10 +117,10 @@ class TestAudioDeviceQuery:
             display_audio_devices()
 
             output = mock_stdout.getvalue()
-            assert "Querying available audio devices..." in output
-            assert "Finished querying devices" in output
-            assert str(mock_devices) in output
-            assert str(mock_hostapis) in output
+            # 新しい出力メッセージに対応
+            assert "--- すべてのオーディオデバイス ---" in output
+            assert "--- 利用可能なホスト API ---" in output
+            assert "【マイク候補】:" in output
 
     def test_display_error_output(self):
         """エラー発生時の表示関数の標準エラー出力をテスト"""
@@ -118,7 +133,8 @@ class TestAudioDeviceQuery:
             display_audio_devices()
 
             output = mock_stderr.getvalue()
-            assert "An error occurred while querying devices:" in output
+            # 新しいエラーメッセージに対応
+            assert "デバイス情報の取得中にエラーが発生しました" in output
             assert "Device query failed" in output
 
     @patch("media_utils.list_audio_devices.sd.query_devices")
