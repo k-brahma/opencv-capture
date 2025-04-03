@@ -338,7 +338,7 @@ class TestRecorderAudioRecordMethod:
         # --- テスト実行 ---
         # _audio_record はブロッキングするため別スレッドで実行
         thread = threading.Thread(target=recorder_instance._audio_record)
-    thread.start()
+        thread.start()
 
         # スレッドがキューのデータを処理するのを少し待つ
         time.sleep(0.5)

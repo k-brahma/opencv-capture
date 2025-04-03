@@ -175,13 +175,13 @@ class AudioConverter:
             logger.info("FFmpegによるWAVからMP3への変換が成功しました！")
             success = True
             if self.cleanup_temp_files:
-            try:
+                try:
                     os.remove(wav_path)
                     logger.info(f"一時的なオーディオファイルを削除しました: {wav_path}")
-            except OSError as e:
+                except OSError as e:
                     logger.warning(f"一時的なオーディオファイル {wav_path} の削除中にエラー: {e}")
-            else:
-                logger.info(f"一時ファイル削除スキップ: {wav_path}")
+                else:
+                    logger.info(f"一時ファイル削除スキップ: {wav_path}")
 
         except subprocess.CalledProcessError as e:
             logger.error("!!!!!!!! FFmpegによるWAVからMP3への変換が失敗しました !!!!!!!!")
@@ -541,74 +541,133 @@ class Recorder:
     def _process_output(self):
         """録画停止後の後処理を実行する内部メソッド。
 
-        現在の実装（オーディオテスト目的）:
-        1. 最終出力ファイル名に基づいて、`.mp3` の拡張子を持つパスを生成します。
-        2. `self.converter.convert_wav_to_mp3` を呼び出し、一時 WAV ファイルを MP3 に変換します。
-        3. 一時ビデオファイル (`self.video_filename_temp`) が存在すれば削除します。
-
-        TODO:
-        本来は、ここで `self.video_success` を確認し、成功していれば
         一時 AVI ビデオファイルと一時 WAV オーディオファイルを FFmpeg でマージし、
-        `self.output_filename_final` (MP4) として保存する処理を実装する必要があります。
+        `self.output_filename_final` (MP4) として保存します。
         マージ成功後に一時ファイル (AVI, WAV) を削除します。
+        ビデオ録画 (`self.video_success`) またはオーディオ録音に問題があった場合は、
+        マージ処理をスキップします。
         """
-        # --- === オーディオテスト: WAVからMP3への変換 === ---
-        mp3_output_filename = os.path.splitext(self.output_filename_final)[0] + ".mp3"
+        logger.info("録画後処理を開始します...")
 
-        # AudioConverter を使って変換を実行
-        conversion_success = self.converter.convert_wav_to_mp3(
-            self.audio_filename_temp, mp3_output_filename
+        # ビデオ録画が成功し、かつ有効なオーディオファイルが存在するか確認
+        audio_file_valid = (
+            os.path.exists(self.audio_filename_temp)
+            and os.path.getsize(self.audio_filename_temp) > 1024  # ある程度のサイズがあるか
         )
-        if conversion_success:
-            logger.info(f"オーディオ変換成功。 {mp3_output_filename} を確認してください。")
-        else:
-            # スキップまたは失敗した場合
-            logger.warning("オーディオ変換に失敗またはスキップされました。")
 
-        # 一時的なビデオファイルのクリーンアップ (変換成否に関わらず実行)
-        if os.path.exists(self.video_filename_temp):
-            try:
-                os.remove(self.video_filename_temp)
+        if not self.video_success:
+            logger.warning("ビデオ録画に失敗したため、マージ処理をスキップします。")
+            # ビデオ失敗時はオーディオファイルも不要なことが多いので削除を試みる
+            if os.path.exists(self.audio_filename_temp):
+                try:
+                    os.remove(self.audio_filename_temp)
+                    logger.info(
+                        f"未使用の一時オーディオファイルを削除しました: {self.audio_filename_temp}"
+                    )
+                except OSError as e:
+                    logger.warning(
+                        f"一時オーディオファイル {self.audio_filename_temp} の削除中にエラー: {e}"
+                    )
+            return  # マージは行わない
+
+        if not audio_file_valid:
+            logger.warning("有効なオーディオファイルが存在しないため、マージ処理をスキップします。")
+            # --- 修正: 音声なしでもビデオを保存 ---
+            if os.path.exists(self.video_filename_temp):
                 logger.info(
-                    f"未使用の一時的なビデオファイルをクリーンアップしました: {self.video_filename_temp}"
+                    f"音声がないため、一時ビデオファイル {self.video_filename_temp} を {self.output_filename_final} にリネームします。"
                 )
+                try:
+                    # 既存の同名ファイルがあれば削除 (念のため)
+                    if os.path.exists(self.output_filename_final):
+                        os.remove(self.output_filename_final)
+                    os.rename(self.video_filename_temp, self.output_filename_final)
+                    logger.info("ビデオのみのファイルの保存に成功しました。")
+                except OSError as e:
+                    logger.error(f"一時ビデオファイルのリネーム中にエラー: {e}")
+                    # リネーム失敗時は一時ファイルを削除しない方がデバッグしやすいかも
+                    # logger.warning(f"リネーム失敗のため一時ビデオファイルを削除します: {self.video_filename_temp}")
+                    # try:
+                    #     os.remove(self.video_filename_temp)
+                    # except OSError as e_rem:
+                    #     logger.error(f"一時ビデオファイルの削除にも失敗: {e_rem}")
+            else:
+                logger.warning("音声ファイルがなく、一時ビデオファイルも見つかりませんでした。")
+            return  # マージは行わない
+
+        # --- FFmpeg によるマージ処理 ---
+        logger.info(f"ビデオとオーディオのマージを開始: {self.output_filename_final}")
+        merge_command = [
+            self.ffmpeg_path,
+            "-y",  # 出力ファイルを上書き
+            "-i",
+            self.video_filename_temp,  # 入力ビデオ
+            "-i",
+            self.audio_filename_temp,  # 入力オーディオ
+            "-c:v",
+            "copy",  # ビデオコーデックをコピー (再エンコードしない)
+            "-c:a",
+            "aac",  # オーディオコーデックをAACにエンコード
+            "-strict",
+            "experimental",  # 古いFFmpegでのAAC互換性用 (不要な場合もある)
+            "-map",
+            "0:v:0",  # 最初の入力 (ビデオ) のビデオストリームを選択
+            "-map",
+            "1:a:0",  # 2番目の入力 (オーディオ) のオーディオストリームを選択
+            self.output_filename_final,  # 出力ファイルパス
+        ]
+        merge_success = False
+        try:
+            logger.debug(f"FFmpegマージコマンドを実行: {' '.join(merge_command)}")
+            startupinfo = None
+            if os.name == "nt":  # Windowsの場合、コンソールウィンドウを非表示に
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+
+            process = subprocess.run(
+                merge_command,
+                check=True,  # エラーコードが0以外なら例外発生
+                capture_output=True,  # 標準出力/エラーをキャプチャ
+                text=True,  # テキストモードでキャプチャ
+                startupinfo=startupinfo,
+            )
+            logger.info(f"FFmpegによるマージが成功しました！ 出力: {self.output_filename_final}")
+            logger.debug(f"FFmpeg stdout:\n{process.stdout}")
+            logger.debug(f"FFmpeg stderr:\n{process.stderr}")
+            merge_success = True
+        except subprocess.CalledProcessError as e:
+            logger.error("!!!!!!!! FFmpegによるマージ処理が失敗しました !!!!!!!!")
+            logger.error(f"コマンド: {' '.join(e.cmd)}")
+            logger.error(f"リターンコード: {e.returncode}")
+            logger.error(f"エラー出力 (stderr):\n{e.stderr}")
+        except FileNotFoundError:
+            logger.error(
+                f"エラー: '{self.ffmpeg_path}' コマンドが見つかりません。FFmpegがインストールされ、PATHに含まれているか確認してください。"
+            )
+        except Exception as e:
+            logger.exception(f"FFmpegマージ中に予期せぬエラーが発生しました: {e}")
+
+        # --- 一時ファイルのクリーンアップ ---
+        if merge_success:
+            logger.info("マージ成功のため、一時ファイルを削除します。")
+            try:
+                if os.path.exists(self.video_filename_temp):
+                    os.remove(self.video_filename_temp)
+                    logger.debug(f"一時ビデオファイルを削除しました: {self.video_filename_temp}")
+                if os.path.exists(self.audio_filename_temp):
+                    os.remove(self.audio_filename_temp)
+                    logger.debug(
+                        f"一時オーディオファイルを削除しました: {self.audio_filename_temp}"
+                    )
             except OSError as e:
-                logger.warning(
-                    f"一時的なビデオファイル {self.video_filename_temp} のクリーンアップ中にエラー: {e}"
-                )
+                logger.warning(f"マージ成功後の一時ファイル削除中にエラー: {e}")
+        else:
+            logger.warning("マージに失敗したため、一時ファイルは削除されませんでした。")
+            logger.warning(f"一時ビデオ: {self.video_filename_temp}")
+            logger.warning(f"一時オーディオ: {self.audio_filename_temp}")
 
-        logger.info(
-            f"オーディオテストプロセスが完了しました。{mp3_output_filename} を確認してください。"
-        )
-
-        # --- === TODO: オリジナルのマージロジックを復元 === ---
-        # if self.video_success and conversion_success: # conversion_success はマージ処理に置き換わる
-        #     print(f"ビデオとオーディオのマージを開始: {self.output_filename_final}")
-        #     # ffmpeg -i video.avi -i audio.wav -c:v copy -c:a aac output.mp4 のようなコマンド
-        #     merge_command = [
-        #         self.ffmpeg_path, "-y",
-        #         "-i", self.video_filename_temp,
-        #         "-i", self.audio_filename_temp,
-        #         "-c:v", "copy", # ビデオは再エンコードしない (必要なら調整)
-        #         "-c:a", "aac", # オーディオエンコーダ (MP4標準)
-        #         "-strict", "experimental", # 古いFFmpegでaacを使う場合に必要かも
-        #         self.output_filename_final
-        #     ]
-        #     try:
-        #         # ... subprocess.run でマージ実行 ...
-        #         print("マージ成功！")
-        #         # マージ成功後に一時ファイルを削除
-        #         # os.remove(self.video_filename_temp)
-        #         # os.remove(self.audio_filename_temp)
-        #     except Exception as e:
-        #         print(f"マージ処理中にエラー: {e}")
-        # elif not self.video_success:
-        #     print("ビデオ録画に失敗したため、マージ処理をスキップしました。")
-        # else: # not conversion_success (またはオーディオファイルがない場合)
-        #     print("オーディオ処理に失敗またはオーディオがないため、マージ処理をスキップしました。")
-        #     # ビデオのみ成功した場合は、一時ビデオを最終ファイル名にリネームするなどの代替案も考えられる
-        #     # if os.path.exists(self.video_filename_temp):
-        #     #    os.rename(self.video_filename_temp, os.path.splitext(self.output_filename_final)[0] + ".avi")
+        logger.info("録画後処理が完了しました。")
 
     def start(self):
         """録画プロセスを開始します。
