@@ -8,7 +8,7 @@ import sounddevice as sd
 from flask import Flask, jsonify, render_template, request, send_from_directory
 
 # Import the Recorder class
-from media_utils.recorder import Recorder, default_channels, default_samplerate
+from media_utils.recorder import Recorder
 
 app = Flask(__name__)
 
@@ -108,40 +108,43 @@ def start_recording_route():
 
         # --- Determine Audio Settings ---
         target_device_index = 10  # Try Stereo Mix first
-        samplerate = default_samplerate
-        channels = default_channels
+        samplerate = Recorder.DEFAULT_SAMPLERATE
+        channels = Recorder.DEFAULT_CHANNELS
         selected_device_index = None  # Store the actually used device index
         try:
             device_info = sd.query_devices(target_device_index, "input")
-            samplerate = int(device_info["default_samplerate"])
+            samplerate = int(device_info.get("default_samplerate", Recorder.DEFAULT_SAMPLERATE))  # type: ignore
             channels = (
-                1 if device_info["max_input_channels"] >= 1 else device_info["max_input_channels"]
-            )
+                1 if device_info.get("max_input_channels", 0) >= 1 else 0  # type: ignore
+            )  # .get() に合わせて 0 をデフォルトに
             selected_device_index = target_device_index
-            print(
-                f"Using Stereo Mix (Device {target_device_index}) with {samplerate} Hz, {channels} channels."
-            )
+            device_name = device_info.get("name", f"Device {target_device_index}")  # type: ignore
+            print(f"Using {device_name} with {samplerate} Hz, {channels} channels.")
         except (ValueError, sd.PortAudioError) as e:
             print(
-                f"Could not use Stereo Mix ({target_device_index}): {e}. Falling back to default."
+                f"Could not use target device ({target_device_index}): {e}. Falling back to default."
             )
             try:
                 default_device_info = sd.query_devices(kind="input")
-                samplerate = int(default_device_info["default_samplerate"])
+                samplerate = int(default_device_info.get("default_samplerate", Recorder.DEFAULT_SAMPLERATE))  # type: ignore
                 channels = (
                     1
-                    if default_device_info["max_input_channels"] >= 1
-                    else default_device_info["max_input_channels"]
+                    if default_device_info.get("max_input_channels", 0) >= 1  # type: ignore
+                    else 0
                 )
                 selected_device_index = None  # Indicate default device
+                default_device_name = default_device_info.get("name", "Unknown Default Device")  # type: ignore
                 print(
-                    f"Using default input ({default_device_info['name']}) with {samplerate} Hz, {channels} channels."
+                    f"Using default input ({default_device_name}) with {samplerate} Hz, {channels} channels."
                 )
             except Exception as e_fallback:
                 print(f"Could not query default input: {e_fallback}. Using hardcoded defaults.")
-                samplerate = default_samplerate
-                channels = default_channels
+                samplerate = Recorder.DEFAULT_SAMPLERATE
+                channels = Recorder.DEFAULT_CHANNELS
                 selected_device_index = None
+                print(
+                    f"Using default input (Unknown Default Device) with {samplerate} Hz, {channels} channels."
+                )
 
         # --- Create Recorder instance and Start Thread ---
         recording = True  # Set recording state

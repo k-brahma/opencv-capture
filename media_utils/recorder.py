@@ -42,219 +42,52 @@ import soundfile as sf
 # 注意: このモジュールは共有のaudio_queueとstop_eventの管理のためにapp.pyに依存しています。
 # 将来的にはクラスベースのアプローチでこれをより良くカプセル化できるかもしれません。
 
-# --- モジュールレベル変数 ---
-# 共有キュー（app.pyで管理され、audio_recordで設定される）
-audio_queue = None
 
-# デフォルトのオーディオ設定
-default_samplerate = 44100
-default_channels = 1
+# --- FFmpeg 音声変換クラス ---
+class AudioConverter:
+    """FFmpegを使用して音声ファイルを変換するクラス。"""
 
+    def __init__(self, ffmpeg_path="ffmpeg", cleanup_temp_files=True):
+        """コンストラクタ
 
-# --- オーディオ録音コールバック ---
-def audio_callback(indata, frames, time, status):
-    """オーディオストリームのコールバック。モジュールレベルのaudio_queueを使用します。"""
-    global audio_queue  # モジュールレベル変数にアクセスするために必要
-    if audio_queue is None:
-        print("エラー: audio_queueが録音モジュールで初期化されていません。")
-        return
-    if status:
-        print(status, flush=True)
-    audio_queue.put(indata.copy())
+        Args:
+            ffmpeg_path (str): FFmpeg実行可能ファイルのパス。
+            cleanup_temp_files (bool): 変換後に一時ファイル（入力）を削除するかどうか。
+        """
+        self.ffmpeg_path = ffmpeg_path
+        self.cleanup_temp_files = cleanup_temp_files
 
+    def convert_wav_to_mp3(self, wav_path, mp3_path, bitrate="192k"):
+        """指定されたWAVファイルをMP3に変換します。
 
-# --- オーディオ録音関数 ---
-def audio_record(
-    output_filename,
-    samplerate,
-    channels,
-    stop_event_ref,
-    audio_queue_ref,
-    device_index=None,
-):
-    """オーディオをWAVファイルに録音します。"""
-    global audio_queue
-    audio_queue = audio_queue_ref
+        Args:
+            wav_path (str): 入力WAVファイルのパス。
+            mp3_path (str): 出力MP3ファイルのパス。
+            bitrate (str): 出力MP3のビットレート (例: "192k")。
 
-    print(
-        f"デバイスインデックス {device_index if device_index is not None else 'デフォルト'} からのオーディオ録音を試みます"
-    )
-    print(f"オーディオ録音開始: {output_filename}")
-    try:
-        device_info = sd.query_devices(device_index if device_index is not None else None, "input")
-        print(f"選択されたデバイス情報: {device_info['name']}")
-        actual_samplerate = int(device_info["default_samplerate"])
-        actual_channels = device_info["max_input_channels"]
+        Returns:
+            bool: 変換が成功したかどうか。
+        """
+        if not os.path.exists(wav_path) or os.path.getsize(wav_path) <= 1024:
+            print(f"オーディオ変換をスキップ: WAVファイルが存在しないか空です: {wav_path}")
+            return False
+
         print(
-            f"デバイスがサポートするサンプルレート: {actual_samplerate}, 最大チャンネル数: {actual_channels}"
+            f"--- FFmpeg --- {wav_path} から {mp3_path} への変換を開始します (ビットレート: {bitrate})"
         )
-        print(f"使用するサンプルレート: {samplerate}, チャンネル数: {channels}")
-
-        with sf.SoundFile(
-            output_filename, mode="xb", samplerate=samplerate, channels=channels, format="WAV"
-        ) as file:
-            with sd.InputStream(
-                samplerate=samplerate,
-                channels=channels,
-                callback=audio_callback,
-                device=device_index,
-            ):
-                while not stop_event_ref.is_set():
-                    try:
-                        file.write(audio_queue_ref.get(timeout=0.1))
-                    except queue.Empty:
-                        pass
-    except sd.PortAudioError as e:
-        print(f"デバイス {device_index} の選択時にPortAudioエラーが発生: {e}")
-    except ValueError as e:
-        print(f"無効なデバイスインデックス {device_index} またはパラメータ: {e}")
-    except Exception as e:
-        print(f"オーディオ録音エラー: {e}")
-    finally:
-        print(f"オーディオ録音停止: {output_filename}")
-        audio_queue = None
-
-
-# --- 画面録画とマージ機能 ---
-def screen_record_and_merge(
-    video_filename_temp,
-    audio_filename_temp,
-    output_filename_final,
-    stop_event_ref,
-    audio_queue_ref,
-    duration=10,
-    fps=30,
-    region=None,
-    shorts_format=True,
-    samplerate=default_samplerate,
-    channels=default_channels,
-    audio_device_index=None,
-    ffmpeg_path="ffmpeg",
-):
-    """画面とオーディオを録画し、その後マージします（またはテスト用にオーディオのみ変換）。"""
-
-    # --- オーディオ録音スレッドの開始 ---
-    audio_recording_thread = threading.Thread(
-        target=audio_record,
-        args=(
-            audio_filename_temp,
-            samplerate,
-            channels,
-            stop_event_ref,
-            audio_queue_ref,
-            audio_device_index,
-        ),
-        daemon=True,
-    )
-    audio_recording_thread.start()
-    print("オーディオ録音スレッドを開始しました。")
-
-    # --- 画面録画の開始（FFmpegステップでは出力は無視される） ---
-    out = None
-    video_success = False
-    try:
-        if region is None:
-            screen_width, screen_height = pyautogui.size()
-            region = (0, 0, screen_width, screen_height)
-
-        fourcc = cv2.VideoWriter_fourcc(*"DIVX")
-        output_width, output_height = region[2], region[3]
-        target_size = (output_width, output_height)
-
-        if shorts_format:
-            target_size = (1080, 1920)
-
-        out = cv2.VideoWriter(video_filename_temp, fourcc, fps, target_size)
-        if not out.isOpened():
-            raise IOError(f"ビデオライターを開けませんでした: {video_filename_temp}")
-
-        print(f"ビデオ録画開始（オーディオテスト用に出力は無視）: {video_filename_temp}")
-        start_time = time.time()
-        end_time = start_time + duration if duration > 0 else float("inf")
-        last_frame_time = time.time()
-
-        while not stop_event_ref.is_set() and time.time() < end_time:
-            current_time = time.time()
-            sleep_duration = (1 / fps) - (current_time - last_frame_time)
-            if sleep_duration > 0:
-                time.sleep(sleep_duration)
-            last_frame_time = time.time()
-            img = pyautogui.screenshot(region=region)
-            frame = np.array(img)
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-
-            if shorts_format:
-                h, w = frame.shape[:2]
-                target_h, target_w = target_size[1], target_size[0]
-                source_aspect = w / h
-                target_aspect = target_w / target_h
-                if source_aspect > target_aspect:
-                    new_w = target_w
-                    new_h = int(new_w / source_aspect)
-                    resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                    pad_top = (target_h - new_h) // 2
-                    pad_bottom = target_h - new_h - pad_top
-                    final_frame = cv2.copyMakeBorder(
-                        resized, pad_top, pad_bottom, 0, 0, cv2.BORDER_CONSTANT, value=[0, 0, 0]
-                    )
-                elif source_aspect < target_aspect:
-                    new_h = target_h
-                    new_w = int(new_h * source_aspect)
-                    resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                    pad_left = (target_w - new_w) // 2
-                    pad_right = target_w - new_w - pad_left
-                    final_frame = cv2.copyMakeBorder(
-                        resized, 0, 0, pad_left, pad_right, cv2.BORDER_CONSTANT, value=[0, 0, 0]
-                    )
-                else:
-                    final_frame = cv2.resize(
-                        frame, (target_w, target_h), interpolation=cv2.INTER_AREA
-                    )
-                out.write(final_frame)
-            else:
-                if frame.shape[1] != output_width or frame.shape[0] != output_height:
-                    frame = cv2.resize(
-                        frame, (output_width, output_height), interpolation=cv2.INTER_AREA
-                    )
-                out.write(frame)
-        video_success = True
-
-    except Exception as e:
-        print(f"ビデオ録画エラー: {e}")
-        stop_event_ref.set()
-    finally:
-        if out and out.isOpened():
-            out.release()
-        print(f"ビデオ録画停止（オーディオテスト用に出力は無視）: {video_filename_temp}")
-
-    # --- オーディオ録音スレッドの停止 ---
-    stop_event_ref.set()
-    if audio_recording_thread and audio_recording_thread.is_alive():
-        print("オーディオスレッドの終了を待機中...")
-        audio_recording_thread.join(timeout=5.0)
-        if audio_recording_thread.is_alive():
-            print("警告: オーディオスレッドがタイムアウトしました。")
-
-    # --- === オーディオテスト: WAVからMP3への変換（FFmpeg使用） === ---
-    mp3_output_filename = os.path.splitext(output_filename_final)[0] + ".mp3"
-
-    if os.path.exists(audio_filename_temp) and os.path.getsize(audio_filename_temp) > 1024:
-        print(
-            f"--- オーディオテスト --- {audio_filename_temp} から {mp3_output_filename} への変換を試みます"
-        )
-
         ffmpeg_command = [
-            ffmpeg_path,
+            self.ffmpeg_path,
             "-y",
             "-i",
-            audio_filename_temp,
+            wav_path,
             "-vn",
             "-acodec",
             "libmp3lame",
             "-ab",
-            "192k",
-            mp3_output_filename,
+            bitrate,
+            mp3_path,
         ]
+        success = False
         try:
             print(f"FFmpegコマンドを実行: {' '.join(ffmpeg_command)}")
             startupinfo = None
@@ -270,52 +103,57 @@ def screen_record_and_merge(
                 startupinfo=startupinfo,
             )
             print("FFmpegによるWAVからMP3への変換が成功しました！")
-            try:
-                os.remove(audio_filename_temp)
-                print(f"一時的なオーディオファイルを削除しました: {audio_filename_temp}")
-            except OSError as e:
-                print(f"一時的なオーディオファイル {audio_filename_temp} の削除中にエラー: {e}")
+            success = True
+            if self.cleanup_temp_files:
+                try:
+                    os.remove(wav_path)
+                    print(f"一時的なオーディオファイルを削除しました: {wav_path}")
+                except OSError as e:
+                    print(f"一時的なオーディオファイル {wav_path} の削除中にエラー: {e}")
+            else:
+                print(f"一時ファイル削除スキップ: {wav_path}")
+
         except subprocess.CalledProcessError as e:
             print("!!!!!!!! FFmpegによるWAVからMP3への変換が失敗しました !!!!!!!!")
             print(f"コマンド: {' '.join(e.cmd)}")
             print(f"リターンコード: {e.returncode}")
             print(f"エラー出力 (stderr):\n{e.stderr}")
-            print("一時的なWAVファイルは削除されませんでした。")
         except FileNotFoundError:
-            print(f"エラー: '{ffmpeg_path}' コマンドが見つかりません。")
-            print("一時的なWAVファイルは削除されませんでした。")
+            print(f"エラー: '{self.ffmpeg_path}' コマンドが見つかりません。")
         except Exception as e:
             print(f"FFmpeg変換中に予期せぬエラーが発生しました: {e}")
-            print("一時的なWAVファイルは削除されませんでした。")
-    else:
-        print("オーディオ変換をスキップ: 一時的なオーディオファイルが存在しないか空です。")
+        finally:
+            if not success and not self.cleanup_temp_files:
+                print("変換失敗のため、一時的なWAVファイルは削除されませんでした。")
+            elif not success and self.cleanup_temp_files:
+                # cleanup_temp_files=True でも失敗時は削除しない方がデバッグしやすいかも
+                print("変換失敗のため、一時的なWAVファイルは削除されませんでした。")
 
-    # 一時的なビデオファイルのクリーンアップ
-    if os.path.exists(video_filename_temp):
-        try:
-            os.remove(video_filename_temp)
-            print(f"未使用の一時的なビデオファイルをクリーンアップしました: {video_filename_temp}")
-        except OSError as e:
-            print(f"一時的なビデオファイル {video_filename_temp} のクリーンアップ中にエラー: {e}")
-
-    print(f"オーディオテストプロセスが完了しました。{mp3_output_filename} を確認してください。")
+        return success
 
 
 class Recorder:
+    # --- 修正: デフォルト設定をクラス変数として定義 ---
+    DEFAULT_SAMPLERATE = 44100
+    DEFAULT_CHANNELS = 1
+    DEFAULT_FPS = 30
+    DEFAULT_FFMPEG_PATH = "ffmpeg"
+
     def __init__(
         self,
         video_filename_temp,
         audio_filename_temp,
         output_filename_final,
         stop_event_ref,  # app.pyからのイベントを使用
+        # --- 修正: デフォルト引数でクラス変数を使用 ---
         duration=10,
-        fps=30,
+        fps=DEFAULT_FPS,
         region=None,
         shorts_format=True,
-        samplerate=default_samplerate,
-        channels=default_channels,
+        samplerate=DEFAULT_SAMPLERATE,
+        channels=DEFAULT_CHANNELS,
         audio_device_index=None,
-        ffmpeg_path="ffmpeg",
+        ffmpeg_path=DEFAULT_FFMPEG_PATH,
     ):
         """
         レコーダークラスの初期化。
@@ -326,26 +164,30 @@ class Recorder:
             output_filename_final: 最終出力ファイルのパス
             stop_event_ref: 録画停止用の共有イベント
             duration: 録画時間（秒）
-            fps: フレームレート
+            fps: フレームレート (デフォルト: Recorder.DEFAULT_FPS)
             region: 録画する画面領域（None=全画面）
             shorts_format: ショート動画フォーマットを使用するかどうか
-            samplerate: オーディオのサンプルレート
-            channels: オーディオのチャンネル数
+            samplerate: オーディオのサンプルレート (デフォルト: Recorder.DEFAULT_SAMPLERATE)
+            channels: オーディオのチャンネル数 (デフォルト: Recorder.DEFAULT_CHANNELS)
             audio_device_index: 使用するオーディオデバイスのインデックス
-            ffmpeg_path: FFmpegの実行ファイルパス
+            ffmpeg_path: FFmpegの実行ファイルパス (デフォルト: Recorder.DEFAULT_FFMPEG_PATH)
         """
         self.video_filename_temp = video_filename_temp
         self.audio_filename_temp = audio_filename_temp
         self.output_filename_final = output_filename_final
-        self.stop_event = stop_event_ref  # 共有イベントを使用
+        self.stop_event = stop_event_ref
         self.duration = duration
-        self.fps = fps
+        self.fps = fps  # 初期化時に渡された値を使用
         self.region = region
         self.shorts_format = shorts_format
-        self.samplerate = samplerate
-        self.channels = channels
+        self.samplerate = samplerate  # 初期化時に渡された値を使用
+        self.channels = channels  # 初期化時に渡された値を使用
         self.audio_device_index = audio_device_index
-        self.ffmpeg_path = ffmpeg_path
+        self.ffmpeg_path = ffmpeg_path  # 初期化時に渡された値を使用
+
+        # AudioConverter のインスタンスを Recorder 内に保持
+        # ffmpeg_pathは初期化時に受け取ったものを使う
+        self.converter = AudioConverter(ffmpeg_path=self.ffmpeg_path)
 
         self.audio_queue = queue.Queue()
         self.audio_recording_thread = None
@@ -363,9 +205,9 @@ class Recorder:
         print(f"オーディオ録音開始: {self.audio_filename_temp}")
         try:
             device_info = sd.query_devices(self.audio_device_index, "input")
-            print(f"選択されたデバイス情報: {device_info['name']}")
-            actual_samplerate = int(device_info["default_samplerate"])
-            actual_channels = device_info["max_input_channels"]
+            print(f"選択されたデバイス情報: {device_info['name']}")  # type: ignore
+            actual_samplerate = int(device_info["default_samplerate"])  # type: ignore
+            actual_channels = device_info["max_input_channels"]  # type: ignore
             print(
                 f"デバイスがサポートするサンプルレート: {actual_samplerate}, 最大チャンネル数: {actual_channels}"
             )
@@ -398,11 +240,57 @@ class Recorder:
         finally:
             print(f"オーディオ録音停止: {self.audio_filename_temp}")
 
+    # --- 修正: 新しいプライベートヘルパーメソッドを追加 ---
+    def _resize_and_pad_frame(self, frame, target_size, shorts_format):
+        """フレームを指定されたサイズにリサイズし、必要に応じてパディングします。"""
+        output_height, output_width = (
+            target_size[1],
+            target_size[0],
+        )  # target_size は (width, height)
+
+        if shorts_format:
+            # ショートフォーマット: 縦長 (1080x1920想定) にアスペクト比を維持してリサイズし、黒帯を追加
+            h, w = frame.shape[:2]
+            target_h, target_w = output_height, output_width  # ここでは target_size が (1080, 1920)
+            source_aspect = w / h
+            target_aspect = target_w / target_h
+
+            if source_aspect > target_aspect:  # 元画像がターゲットより横長
+                new_w = target_w
+                new_h = int(new_w / source_aspect)
+                resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                pad_top = (target_h - new_h) // 2
+                pad_bottom = target_h - new_h - pad_top
+                final_frame = cv2.copyMakeBorder(
+                    resized, pad_top, pad_bottom, 0, 0, cv2.BORDER_CONSTANT, value=[0, 0, 0]
+                )
+            elif source_aspect < target_aspect:  # 元画像がターゲットより縦長 (または同じ)
+                new_h = target_h
+                new_w = int(new_h * source_aspect)
+                resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                pad_left = (target_w - new_w) // 2
+                pad_right = target_w - new_w - pad_left
+                final_frame = cv2.copyMakeBorder(
+                    resized, 0, 0, pad_left, pad_right, cv2.BORDER_CONSTANT, value=[0, 0, 0]
+                )
+            else:  # アスペクト比が同じ場合
+                final_frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
+            return final_frame
+        else:
+            # 通常フォーマット: 指定されたサイズに単純にリサイズ
+            # 元のコードでは target_size は region のサイズだった
+            current_h, current_w = frame.shape[:2]
+            if current_w != output_width or current_h != output_height:
+                frame = cv2.resize(
+                    frame, (output_width, output_height), interpolation=cv2.INTER_AREA
+                )
+            return frame
+
     def _screen_record(self):
         """一時的なAVIファイルに画面を録画します。"""
         out = None
         self.video_success = False
-        video_filename = self.video_filename_temp  # 明確にするため
+        video_filename = self.video_filename_temp
         region = self.region
         fps = self.fps
         shorts_format = self.shorts_format
@@ -412,13 +300,15 @@ class Recorder:
                 screen_width, screen_height = pyautogui.size()
                 region = (0, 0, screen_width, screen_height)
 
-            fourcc = cv2.VideoWriter_fourcc(*"DIVX")
+            fourcc = cv2.VideoWriter_fourcc(*"DIVX")  # type: ignore
             output_width, output_height = region[2], region[3]
-            target_size = (output_width, output_height)
-
+            # --- 修正: target_size の決定ロジックをここに集約 ---
             if shorts_format:
-                target_size = (1080, 1920)
+                target_size = (1080, 1920)  # ショート動画の固定サイズ (width, height)
+            else:
+                target_size = (output_width, output_height)  # 録画領域のサイズ (width, height)
 
+            # --- 修正: VideoWriter に渡すサイズを target_size から取得 ---
             out = cv2.VideoWriter(video_filename, fourcc, fps, target_size)
             if not out.isOpened():
                 raise IOError(f"ビデオライターを {video_filename} に対して開けませんでした")
@@ -439,39 +329,9 @@ class Recorder:
                 frame = np.array(img)
                 frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-                # リサイズロジック
-                if shorts_format:
-                    h, w = frame.shape[:2]
-                    target_h, target_w = target_size[1], target_size[0]
-                    source_aspect = w / h
-                    target_aspect = target_w / target_h
-                    if source_aspect > target_aspect:
-                        new_w = target_w
-                        new_h = int(new_w / source_aspect)
-                        r = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                        pad_t = (target_h - new_h) // 2
-                        pad_b = target_h - new_h - pad_t
-                        f = cv2.copyMakeBorder(
-                            r, pad_t, pad_b, 0, 0, cv2.BORDER_CONSTANT, value=[0, 0, 0]
-                        )
-                    elif source_aspect < target_aspect:
-                        new_h = target_h
-                        new_w = int(new_h * source_aspect)
-                        r = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                        pad_l = (target_w - new_w) // 2
-                        pad_r = target_w - new_w - pad_l
-                        f = cv2.copyMakeBorder(
-                            r, 0, 0, pad_l, pad_r, cv2.BORDER_CONSTANT, value=[0, 0, 0]
-                        )
-                    else:
-                        f = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
-                    out.write(f)
-                else:
-                    if frame.shape[1] != output_width or frame.shape[0] != output_height:
-                        frame = cv2.resize(
-                            frame, (output_width, output_height), interpolation=cv2.INTER_AREA
-                        )
-                    out.write(frame)
+                # --- 修正: リサイズとパディング処理をヘルパーメソッドに委譲 ---
+                processed_frame = self._resize_and_pad_frame(frame, target_size, shorts_format)
+                out.write(processed_frame)
 
             self.video_success = True
 
@@ -485,64 +345,17 @@ class Recorder:
 
     def _process_output(self):
         """録画停止後のマージまたはオーディオ変換を処理します。"""
-        # --- === オーディオテスト: WAVからMP3への変換（FFmpeg使用） === ---
+        # --- === オーディオテスト: WAVからMP3への変換 === ---
         mp3_output_filename = os.path.splitext(self.output_filename_final)[0] + ".mp3"
 
-        if (
-            os.path.exists(self.audio_filename_temp)
-            and os.path.getsize(self.audio_filename_temp) > 1024
-        ):
-            print(
-                f"--- オーディオテスト --- {self.audio_filename_temp} から {mp3_output_filename} への変換を試みます"
-            )
-            ffmpeg_command = [
-                self.ffmpeg_path,
-                "-y",
-                "-i",
-                self.audio_filename_temp,
-                "-vn",
-                "-acodec",
-                "libmp3lame",
-                "-ab",
-                "192k",
-                mp3_output_filename,
-            ]
-            try:
-                print(f"FFmpegコマンドを実行: {' '.join(ffmpeg_command)}")
-                startupinfo = None
-                if os.name == "nt":
-                    startupinfo = subprocess.STARTUPINFO()
-                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                    startupinfo.wShowWindow = subprocess.SW_HIDE
-                process = subprocess.run(
-                    ffmpeg_command,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    startupinfo=startupinfo,
-                )
-                print("FFmpegによるWAVからMP3への変換が成功しました！")
-                try:
-                    os.remove(self.audio_filename_temp)
-                    print(f"一時的なオーディオファイルを削除しました: {self.audio_filename_temp}")
-                except OSError as e:
-                    print(
-                        f"一時的なオーディオファイル {self.audio_filename_temp} の削除中にエラー: {e}"
-                    )
-            except subprocess.CalledProcessError as e:
-                print("!!!!!!!! FFmpegによるWAVからMP3への変換が失敗しました !!!!!!!!")
-                print(f"コマンド: {' '.join(e.cmd)}")
-                print(f"リターンコード: {e.returncode}")
-                print(f"エラー出力 (stderr):\n{e.stderr}")
-                print("一時的なWAVファイルは削除されませんでした。")
-            except FileNotFoundError:
-                print(f"エラー: '{self.ffmpeg_path}' コマンドが見つかりません。")
-                print("一時的なWAVファイルは削除されませんでした。")
-            except Exception as e:
-                print(f"FFmpeg変換中に予期せぬエラーが発生しました: {e}")
-                print("一時的なWAVファイルは削除されませんでした。")
+        # --- 修正: self.converter インスタンスを使用 ---
+        conversion_success = self.converter.convert_wav_to_mp3(
+            self.audio_filename_temp, mp3_output_filename
+        )
+        if conversion_success:
+            print(f"オーディオ変換成功。 {mp3_output_filename} を確認してください。")
         else:
-            print("オーディオ変換をスキップ: 一時的なオーディオファイルが存在しないか空です。")
+            print("オーディオ変換に失敗またはスキップされました。")
 
         # 一時的なビデオファイルのクリーンアップ
         if os.path.exists(self.video_filename_temp):
