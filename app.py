@@ -10,6 +10,25 @@ import pyautogui
 import sounddevice as sd
 from flask import Flask, jsonify, render_template, request, send_from_directory
 
+# --- 修正: 使用する Host API を MME に明示的に指定 ---
+try:
+    mme_index = -1
+    host_apis = sd.query_hostapis()
+    for i, api_info in enumerate(host_apis):
+        # api_info が辞書であることを確認してからアクセス
+        if isinstance(api_info, dict) and api_info.get("name") == "MME":
+            mme_index = i
+            break
+    if mme_index != -1:
+        logging.info(f"Setting default Host API to MME (index: {mme_index})")
+        # sd.default.hostapi への代入が正しい方法
+        sd.default.hostapi = mme_index
+    else:
+        logging.warning("MME Host API not found. Using default Host API.")
+except Exception as e:
+    logging.warning(f"Error setting Host API to MME: {e}. Using default Host API.")
+# --- ここまで修正 ---
+
 # Import the Recorder class
 from media_utils.recorder import Recorder
 
@@ -148,36 +167,64 @@ class RecordingRequestHandler:
     def determine_audio_settings(self):
         """オーディオデバイスをクエリし、録音に使用する設定を決定する。"""
         logging.debug("Determining audio settings...")
-        target_device_index = 10  # Stereo Mix を優先試行
+        target_device_index = 2  # <<<--- ステレオミキサーの MME でのインデックスに変更 (以前は 11)
         self.samplerate = Recorder.DEFAULT_SAMPLERATE
         self.channels = Recorder.DEFAULT_CHANNELS
-        self.selected_device_index = None
+        self.selected_device_index = target_device_index
+
         try:
             logging.debug(f"Attempting to query target device: {target_device_index}")
-            device_info = sd.query_devices(target_device_index, "input")
-            logging.debug(f"Target device info raw: {device_info}")
-            self.samplerate = int(device_info.get("default_samplerate", Recorder.DEFAULT_SAMPLERATE))  # type: ignore
-            self.channels = 1 if device_info.get("max_input_channels", 0) >= 1 else 0  # type: ignore
-            self.selected_device_index = target_device_index
-            device_name = device_info.get("name", f"Device {target_device_index}")  # type: ignore
-            logging.info(
-                f"Using target device ({device_name}) with {self.samplerate} Hz, {self.channels} channels."
-            )
+            device_info_raw = sd.query_devices(target_device_index, "input")
+            device_info = None
+            if isinstance(device_info_raw, dict):
+                device_info = device_info_raw
+
+            if device_info:
+                logging.debug(f"Target device info raw: {device_info}")
+                self.samplerate = int(
+                    device_info.get("default_samplerate", Recorder.DEFAULT_SAMPLERATE)
+                )
+                self.channels = 2 if device_info.get("max_input_channels", 0) >= 2 else 1
+                self.selected_device_index = target_device_index
+                device_name = device_info.get("name", f"Device {target_device_index}")
+                logging.info(
+                    f"Using target device ({device_name}) with {self.samplerate} Hz, {self.channels} channels."
+                )
+            else:
+                raise ValueError(
+                    f"Device with index {target_device_index} not found or returned unexpected format."
+                )
+
         except (ValueError, sd.PortAudioError) as e:
             logging.warning(
                 f"Could not use target device ({target_device_index}): {e}. Falling back to default."
             )
             try:
                 logging.debug("Attempting to query default input device...")
-                default_device_info = sd.query_devices(kind="input")
-                logging.debug(f"Default device info raw: {default_device_info}")
-                self.samplerate = int(default_device_info.get("default_samplerate", Recorder.DEFAULT_SAMPLERATE))  # type: ignore
-                self.channels = 1 if default_device_info.get("max_input_channels", 0) >= 1 else 0  # type: ignore
-                self.selected_device_index = None
-                default_device_name = default_device_info.get("name", "Unknown Default Device")  # type: ignore
-                logging.info(
-                    f"Using default input ({default_device_name}) with {self.samplerate} Hz, {self.channels} channels."
-                )
+                default_device_info_raw = sd.query_devices(kind="input")
+                default_device_info = None
+                if isinstance(default_device_info_raw, dict):  # デフォルトデバイスも型チェック
+                    default_device_info = default_device_info_raw
+                # elif isinstance(default_device_info_raw, list) ... # 必要ならリスト対応
+
+                if default_device_info:
+                    logging.debug(f"Default device info raw: {default_device_info}")
+                    self.samplerate = int(
+                        default_device_info.get("default_samplerate", Recorder.DEFAULT_SAMPLERATE)
+                    )
+                    # フォールバック時は max_channels を確認して 1 or 2 を設定 (マイクは通常1ch)
+                    self.channels = (
+                        2 if default_device_info.get("max_input_channels", 0) >= 2 else 1
+                    )
+                    self.selected_device_index = None  # デフォルトデバイスを使用
+                    default_device_name = default_device_info.get("name", "Unknown Default Device")
+                    logging.info(
+                        f"Using default input ({default_device_name}) with {self.samplerate} Hz, {self.channels} channels."
+                    )
+                else:
+                    raise ValueError(
+                        "Default input device not found or returned unexpected format."
+                    )
             except Exception as e_fallback:
                 logging.error(
                     f"Could not query default input: {e_fallback}. Using hardcoded defaults."
