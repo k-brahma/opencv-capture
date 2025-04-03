@@ -1,151 +1,66 @@
 import datetime
 import os
+import queue
 import threading
-import time
 
-import cv2
-import numpy as np
 import pyautogui
+import sounddevice as sd
 from flask import Flask, jsonify, render_template, request, send_from_directory
+
+# Import the Recorder class
+from media_utils.recorder import Recorder, default_channels, default_samplerate
 
 app = Flask(__name__)
 
-# 録画保存フォルダ
-UPLOAD_FOLDER = "recordings"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+# Configuration
+RECORDINGS_FOLDER = "recordings"
+TEMP_FOLDER = "temp_recordings"
+os.makedirs(RECORDINGS_FOLDER, exist_ok=True)
+os.makedirs(TEMP_FOLDER, exist_ok=True)
+app.config["RECORDINGS_FOLDER"] = RECORDINGS_FOLDER
+app.config["TEMP_FOLDER"] = TEMP_FOLDER
+app.config["FFMPEG_PATH"] = "ffmpeg"  # Path to ffmpeg executable, change if not in PATH
 
-# アプリケーション状態変数
+# --- Application State ---
 recording = False
-recording_thread = None
-current_filename = None
+recorder_instance = None  # Holds the current Recorder instance
+main_recording_thread = None
+stop_event = threading.Event()
 
-
-def screen_record(output_filename, duration=10, fps=30, region=None, shorts_format=True):
-    global recording, current_filename
-
-    current_filename = output_filename
-    recording = True
-
-    # 画面サイズの取得
-    if region is None:
-        screen_width, screen_height = pyautogui.size()
-        region = (0, 0, screen_width, screen_height)
-    # else: region is already a tuple (left, top, width, height)
-
-    # VideoWriterの設定
-    fourcc = cv2.VideoWriter_fourcc(*"DIVX")  # Changed codec to DIVX
-
-    output_width = region[2]
-    output_height = region[3]
-    target_size = (output_width, output_height)
-
-    if shorts_format:
-        # YouTube Shorts用の設定（1080x1920）
-        target_size = (1080, 1920)
-
-    out = cv2.VideoWriter(output_filename, fourcc, fps, target_size)
-
-    start_time = time.time()
-    end_time = start_time + duration if duration > 0 else float("inf")
-    last_frame_time = time.time()
-
-    try:
-        while recording and time.time() < end_time:
-            # 目標フレーム時間からの待機時間を計算 (より正確なFPS制御のため)
-            current_time = time.time()
-            sleep_duration = (1 / fps) - (current_time - last_frame_time)
-            if sleep_duration > 0:
-                time.sleep(sleep_duration)
-            last_frame_time = time.time()  # time.sleep後にもう一度取得
-
-            # スクリーンショットを取得
-            img = pyautogui.screenshot(region=region)
-
-            # OpenCVで処理できるように変換（RGBからBGRへ）
-            frame = np.array(img)
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-
-            # YouTube Shorts用にリサイズ
-            if shorts_format:
-                # 元のアスペクト比を保持しながら、縦型動画にフィットさせる
-                h, w = frame.shape[:2]
-                target_h, target_w = target_size[1], target_size[0]  # 1920, 1080
-
-                # アスペクト比を計算
-                source_aspect = w / h
-                target_aspect = target_w / target_h  # 9 / 16
-
-                if (
-                    source_aspect > target_aspect
-                ):  # 元画像がターゲットより横長 -> 幅を基準にリサイズ
-                    new_w = target_w
-                    new_h = int(new_w / source_aspect)
-                    resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                    # 上下に黒帯を追加
-                    pad_top = (target_h - new_h) // 2
-                    pad_bottom = target_h - new_h - pad_top
-                    final_frame = cv2.copyMakeBorder(
-                        resized, pad_top, pad_bottom, 0, 0, cv2.BORDER_CONSTANT, value=[0, 0, 0]
-                    )
-                elif (
-                    source_aspect < target_aspect
-                ):  # 元画像がターゲットより縦長 -> 高さを基準にリサイズ
-                    new_h = target_h
-                    new_w = int(new_h * source_aspect)
-                    resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                    # 左右に黒帯を追加
-                    pad_left = (target_w - new_w) // 2
-                    pad_right = target_w - new_w - pad_left
-                    final_frame = cv2.copyMakeBorder(
-                        resized, 0, 0, pad_left, pad_right, cv2.BORDER_CONSTANT, value=[0, 0, 0]
-                    )
-                else:  # アスペクト比が同じ
-                    final_frame = cv2.resize(
-                        frame, (target_w, target_h), interpolation=cv2.INTER_AREA
-                    )
-
-                # フレームを書き込む
-                out.write(final_frame)
-            else:
-                # 指定されたサイズにリサイズして書き込む（領域指定がない場合は元のサイズ）
-                if frame.shape[1] != output_width or frame.shape[0] != output_height:
-                    frame = cv2.resize(
-                        frame, (output_width, output_height), interpolation=cv2.INTER_AREA
-                    )
-                out.write(frame)
-
-    except Exception as e:
-        print(f"録画エラー: {str(e)}")
-        # TODO: エラー状態をUIに通知する仕組み
-
-    finally:
-        # リソースの解放
-        if out.isOpened():
-            out.release()
-        recording = False
-        print(f"録画完了 or 停止: {output_filename}")
-        current_filename = None  # グローバル変数をリセット
-
+# Variables to track current operation for status endpoint
+current_status_info = {"final_output": None}
 
 # --- Flask Routes ---
 
 
 @app.route("/")
 def index():
+    # Clean up leftover temp files
+    for folder in [app.config["TEMP_FOLDER"], app.config["RECORDINGS_FOLDER"]]:
+        if not os.path.isdir(folder):
+            continue
+        for f in os.listdir(folder):
+            # Clean temp AVI/WAV or potentially failed MP3 tests
+            if f.startswith("screen_recording_") and (
+                f.endswith(".avi") or f.endswith(".wav") or f.endswith(".mp3")
+            ):
+                try:
+                    os.remove(os.path.join(folder, f))
+                    print(f"Removed leftover temp/test file: {f}")
+                except OSError as e:
+                    print(f"Error removing leftover file {f}: {e}")
     return render_template("index.html")
 
 
 @app.route("/start_recording", methods=["POST"])
-def start_recording_route():  # Renamed to avoid conflict with function name
-    global recording_thread, recording, current_filename
+def start_recording_route():
+    global main_recording_thread, recording, stop_event, recorder_instance, current_status_info
 
     if recording:
         return jsonify({"status": "error", "message": "すでに録画中です"})
 
-    # リクエストから設定を取得
     data = request.json
-    if not data:  # Check if data is None or empty
+    if not data:
         return (
             jsonify(
                 {"status": "error", "message": "リクエストボディが空か、JSON形式ではありません。"}
@@ -153,90 +68,188 @@ def start_recording_route():  # Renamed to avoid conflict with function name
             400,
         )
 
-    duration = int(data.get("duration", 30))  # Default duration 30s
-    fps = int(data.get("fps", 30))
-    shorts_format = data.get("shorts_format", True)
+    try:
+        duration = int(data.get("duration", 30))
+        fps = int(data.get("fps", 30))
+        shorts_format = data.get("shorts_format", True)
+        region_enabled = data.get("region_enabled", False)
+        region = None
 
-    region_enabled = data.get("region_enabled", False)
-    region = None
-    if region_enabled:
-        try:
+        # --- Generate Filenames ---
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_filename = f"screen_recording_{timestamp}"
+        temp_video_file = os.path.join(app.config["TEMP_FOLDER"], f"{base_filename}_temp.avi")
+        temp_audio_file = os.path.join(app.config["TEMP_FOLDER"], f"{base_filename}_temp.wav")
+        # Output filename for Recorder (will be MP3 in test mode)
+        output_filename = os.path.join(
+            app.config["RECORDINGS_FOLDER"], f"{base_filename}.mp4"
+        )  # Intended final name
+
+        # --- Setup Recording Region ---
+        if region_enabled:
             left = int(data.get("left", 0))
             top = int(data.get("top", 0))
             width = int(data.get("width", 800))
             height = int(data.get("height", 600))
-            # Ensure width and height are positive
             if width <= 0 or height <= 0:
-                raise ValueError("幅と高さは正の値である必要があります")
-            # Check if region is within screen bounds (optional but good practice)
+                raise ValueError("幅と高さは正の値")
             screen_width, screen_height = pyautogui.size()
             if left < 0 or top < 0 or left + width > screen_width or top + height > screen_height:
                 print(
-                    f"警告: 指定された領域({left},{top},{width},{height})が画面サイズ({screen_width},{screen_height})を超えています。"
+                    f"警告: 領域({left},{top},{width},{height})が画面({screen_width},{screen_height})外. 調整します."
                 )
-                # Adjust if necessary or just warn
                 left = max(0, left)
                 top = max(0, top)
                 width = min(width, screen_width - left)
                 height = min(height, screen_height - top)
                 if width <= 0 or height <= 0:
                     raise ValueError("画面内に有効な録画領域がありません")
-
             region = (left, top, width, height)
-        except ValueError as e:
-            return jsonify({"status": "error", "message": f"領域指定エラー: {str(e)}"})
-        except Exception as e:
-            return jsonify(
-                {"status": "error", "message": f"領域指定の処理中に予期せぬエラー: {str(e)}"}
+
+        # --- Determine Audio Settings ---
+        target_device_index = 10  # Try Stereo Mix first
+        samplerate = default_samplerate
+        channels = default_channels
+        selected_device_index = None  # Store the actually used device index
+        try:
+            device_info = sd.query_devices(target_device_index, "input")
+            samplerate = int(device_info["default_samplerate"])
+            channels = (
+                1 if device_info["max_input_channels"] >= 1 else device_info["max_input_channels"]
             )
+            selected_device_index = target_device_index
+            print(
+                f"Using Stereo Mix (Device {target_device_index}) with {samplerate} Hz, {channels} channels."
+            )
+        except (ValueError, sd.PortAudioError) as e:
+            print(
+                f"Could not use Stereo Mix ({target_device_index}): {e}. Falling back to default."
+            )
+            try:
+                default_device_info = sd.query_devices(kind="input")
+                samplerate = int(default_device_info["default_samplerate"])
+                channels = (
+                    1
+                    if default_device_info["max_input_channels"] >= 1
+                    else default_device_info["max_input_channels"]
+                )
+                selected_device_index = None  # Indicate default device
+                print(
+                    f"Using default input ({default_device_info['name']}) with {samplerate} Hz, {channels} channels."
+                )
+            except Exception as e_fallback:
+                print(f"Could not query default input: {e_fallback}. Using hardcoded defaults.")
+                samplerate = default_samplerate
+                channels = default_channels
+                selected_device_index = None
 
-    # ファイル名を作成
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = os.path.join(app.config["UPLOAD_FOLDER"], f"screen_recording_{timestamp}.mp4")
+        # --- Create Recorder instance and Start Thread ---
+        recording = True  # Set recording state
+        stop_event.clear()
+        current_status_info["final_output"] = output_filename  # Store intended final name
 
-    # 別スレッドで録画を開始
-    recording_thread = threading.Thread(
-        target=screen_record,
-        args=(filename, duration, fps, region, shorts_format),
-        daemon=True,  # Set daemon to True so thread doesn't block app exit
-    )
-    recording_thread.start()
+        recorder_instance = Recorder(
+            video_filename_temp=temp_video_file,
+            audio_filename_temp=temp_audio_file,
+            output_filename_final=output_filename,  # Pass intended final name
+            stop_event_ref=stop_event,  # Pass the shared event
+            duration=duration,
+            fps=fps,
+            region=region,
+            shorts_format=shorts_format,
+            samplerate=samplerate,
+            channels=channels,
+            audio_device_index=selected_device_index,
+            ffmpeg_path=app.config["FFMPEG_PATH"],
+        )
 
-    return jsonify({"status": "success", "message": f"録画を開始しました ({filename})"})
+        main_recording_thread = threading.Thread(
+            target=run_recording_process,  # Wrapper function
+            args=(recorder_instance,),
+            daemon=True,
+        )
+        main_recording_thread.start()
+
+        return jsonify(
+            {
+                "status": "success",
+                "message": f"録画を開始しました ({os.path.basename(output_filename)})",
+            }
+        )
+
+    except ValueError as e:
+        recording = False  # Reset state on error
+        return jsonify({"status": "error", "message": f"設定エラー: {str(e)}"}), 400
+    except Exception as e:
+        recording = False  # Reset state on error
+        print(f"録画開始処理中の予期せぬエラー: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return jsonify({"status": "error", "message": f"録画開始エラー: {str(e)}"}), 500
+
+
+def run_recording_process(recorder):
+    """Wrapper function to run recorder.start() and manage state."""
+    global recording, stop_event, recorder_instance, current_status_info
+    try:
+        recorder.start()
+    except Exception as e:
+        print(f"Error during recording process thread: {e}")
+        if recorder and recorder.stop_event:
+            recorder.stop_event.set()
+    finally:
+        print("Recording thread finished, resetting state.")
+        recording = False
+        recorder_instance = None  # Clear instance
+        current_status_info["final_output"] = None
+        # stop_event.clear() # No need to clear here, cleared on next start
 
 
 @app.route("/stop_recording", methods=["POST"])
-def stop_recording_route():  # Renamed to avoid conflict
-    global recording
+def stop_recording_route():
+    global recording, stop_event, recorder_instance
 
-    if not recording:
+    if not recording or recorder_instance is None:
         return jsonify({"status": "error", "message": "録画していません"})
 
-    recording = False  # Signal the recording thread to stop
-    # Wait briefly for the thread to finish writing the file? Optional.
-    # if recording_thread and recording_thread.is_alive():
-    #    recording_thread.join(timeout=2.0) # Wait max 2 seconds
+    print("Stop recording request received. Signaling recorder...")
+    # Use the recorder's stop method (which sets the event)
+    recorder_instance.stop()
 
+    # The thread's finally block will reset the main `recording` flag
     return jsonify({"status": "success", "message": "録画停止リクエストを送信しました"})
 
 
 @app.route("/status", methods=["GET"])
 def get_status():
-    # Potentially add more status info later (e.g., error state)
-    return jsonify({"recording": recording, "current_file": current_filename})
+    global recording, current_status_info
+    # Return recording status and the *final* output filename being processed
+    return jsonify(
+        {
+            "recording": recording,
+            "current_file": (
+                os.path.basename(current_status_info["final_output"])
+                if current_status_info["final_output"]
+                else None
+            ),
+        }
+    )
 
 
 @app.route("/recordings", methods=["GET"])
 def list_recordings():
     try:
+        # List final MP4/MP3 files from the RECORDINGS_FOLDER
+        recordings_dir = app.config["RECORDINGS_FOLDER"]
         files = [
             f
-            for f in os.listdir(app.config["UPLOAD_FOLDER"])
-            if f.endswith(".mp4") and os.path.isfile(os.path.join(app.config["UPLOAD_FOLDER"], f))
+            for f in os.listdir(recordings_dir)
+            if (f.endswith(".mp4") or f.endswith(".mp3"))
+            and os.path.isfile(os.path.join(recordings_dir, f))
         ]
-        # Sort by modification time, newest first
         files.sort(
-            key=lambda x: os.path.getmtime(os.path.join(app.config["UPLOAD_FOLDER"], x)),
+            key=lambda x: os.path.getmtime(os.path.join(recordings_dir, x)),
             reverse=True,
         )
         return jsonify({"recordings": files})
@@ -250,10 +263,11 @@ def list_recordings():
         )
 
 
-@app.route("/download/<path:filename>", methods=["GET"])  # Use path converter for flexibility
-def download_file_route(filename):  # Renamed
+@app.route("/download/<path:filename>", methods=["GET"])
+def download_file_route(filename):
     try:
-        return send_from_directory(app.config["UPLOAD_FOLDER"], filename, as_attachment=True)
+        recordings_dir = app.config["RECORDINGS_FOLDER"]
+        return send_from_directory(recordings_dir, filename, as_attachment=True)
     except FileNotFoundError:
         return jsonify({"status": "error", "message": "ファイルが見つかりません。"}), 404
     except Exception as e:
@@ -264,10 +278,11 @@ def download_file_route(filename):  # Renamed
         )
 
 
-@app.route("/delete/<path:filename>", methods=["DELETE"])  # Use path converter
-def delete_file_route(filename):  # Renamed
+@app.route("/delete/<path:filename>", methods=["DELETE"])
+def delete_file_route(filename):
     try:
-        file_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+        recordings_dir = app.config["RECORDINGS_FOLDER"]
+        file_path = os.path.join(recordings_dir, filename)
         if os.path.exists(file_path) and os.path.isfile(file_path):
             os.remove(file_path)
             return jsonify({"status": "success", "message": f"{filename} を削除しました"})
@@ -292,6 +307,4 @@ def delete_file_route(filename):  # Renamed
 
 
 if __name__ == "__main__":
-    # Use host='0.0.0.0' to be accessible from other devices on the network
-    # Use debug=False for production or stable use, debug=True enables auto-reloading and more detailed errors
-    app.run(debug=True, host="127.0.0.1", port=5000)  # Keep default localhost and port
+    app.run(debug=True, host="127.0.0.1", port=5000)

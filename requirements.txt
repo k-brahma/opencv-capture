@@ -1,4 +1,9 @@
 Flask>=2.0
 opencv-python>=4.5
 numpy>=1.20
-pyautogui>=0.9 
+pyautogui>=0.9
+pyscreeze>=0.1
+Pillow>=9.0
+sounddevice>=0.4
+soundfile>=0.12
+pytest>=7.0 
