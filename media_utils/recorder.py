@@ -509,36 +509,61 @@ class Recorder:
         # オーディオフィルターとマッピングの決定
         audio_output_map_label = None
         if len(audio_inputs_for_filter) >= 2:
-            # 2つ以上の有効なオーディオ入力がある場合 -> amix でミックス
-            filter_complex = f"{''.join(audio_inputs_for_filter)}amix=inputs={len(audio_inputs_for_filter)}:duration=longest[a_mix]"
-            ffmpeg_command.extend(["-filter_complex", filter_complex])
-            audio_output_map_label = "[a_mix]"  # ミックスされたオーディオを出力にマッピング
-            logger.info(
-                f"{len(audio_inputs_for_filter)} 個のオーディオストリームをミックスします。"
+            # 2つ以上の有効なオーディオ入力がある場合、より高度な同期処理を適用
+            # 1. 全ストリーム（ビデオ含む）のPTSを同じ原点にリセット
+            # 2. システム音声に少し早め開始の調整を適用
+            # 3. asynctsフィルターで自動同期
+            filter_complex = (
+                # ビデオのPTSをリセット（参照点として設定）
+                f"[0:v:0]setpts=PTS-STARTPTS[v_synced];"
+                # マイク音声のPTSをリセット、さらに非同期対応
+                f"{audio_inputs_for_filter[0]}asetpts=PTS-STARTPTS,asetnsamples=n=1024,aresample=async=1000[a_mic];"
+                # システム音声のPTSをリセットし、遅延を前倒しで補正、さらに非同期対応
+                f"{audio_inputs_for_filter[1]}asetpts=PTS-STARTPTS-0.5/TB,asetnsamples=n=1024,aresample=async=1000[a_sys];"
+                # 両方のオーディオをミックス
+                f"[a_mic][a_sys]amix=inputs=2:duration=longest:normalize=0[a_mix]"
             )
+            ffmpeg_command.extend(["-filter_complex", filter_complex])
+            # 同期済みビデオとオーディオをマッピング
+            ffmpeg_command.extend(["-map", "[v_synced]", "-map", "[a_mix]"])
+            # audioマッピングラベルをNoneに設定（すでにマッピング完了のため）
+            audio_output_map_label = None
+            logger.info("高度な同期処理でマイク音声とシステム音声をミックスします。")
         elif len(audio_inputs_for_filter) == 1:
-            # 有効なオーディオ入力が1つだけの場合 -> フィルター不要、直接マッピング
-            # input_map から該当するマッピング ("1:a:0" など) を取得
-            if mic_audio_valid:
-                audio_output_map_label = input_map["mic_audio"]
-            elif sys_audio_valid:
-                audio_output_map_label = input_map["sys_audio"]
-            logger.info("1個のオーディオストリームを直接マッピングします。")
+            # 有効なオーディオ入力が1つだけの場合も同期処理を適用
+            filter_complex = (
+                # ビデオのPTSをリセット
+                f"[0:v:0]setpts=PTS-STARTPTS[v_synced];"
+                # オーディオのPTSをリセット、非同期対応
+                f"{audio_inputs_for_filter[0]}asetpts=PTS-STARTPTS,asetnsamples=n=1024,aresample=async=1000[a_synced]"
+            )
+            ffmpeg_command.extend(["-filter_complex", filter_complex])
+            # 同期済みビデオとオーディオをマッピング
+            ffmpeg_command.extend(["-map", "[v_synced]", "-map", "[a_synced]"])
+            # audioマッピングラベルをNoneに設定（すでにマッピング完了のため）
+            audio_output_map_label = None
+            logger.info("単一オーディオストリームを同期処理しました。")
         else:
             # 有効なオーディオ入力がない場合
-            logger.warning("有効なオーディオ入力がないため、音声なし (-an) で処理します。")
+            # ビデオのPTSのみリセット
+            filter_complex = f"[0:v:0]setpts=PTS-STARTPTS[v_synced]"
+            ffmpeg_command.extend(["-filter_complex", filter_complex])
+            ffmpeg_command.extend(["-map", "[v_synced]"])
             ffmpeg_command.extend(["-an"])  # オーディオなし
+            logger.warning("有効なオーディオ入力がないため、音声なし (-an) で処理します。")
 
-        # マッピング指定とコーデック設定
-        ffmpeg_command.extend(["-map", input_map["video"]])  # ビデオストリームは常にマッピング
-        ffmpeg_command.extend(["-c:v", "copy"])  # ビデオはコピー
+        # コーデック設定
+        ffmpeg_command.extend(["-c:v", "libx264"])  # ビデオはコピーではなくエンコード（同期のため）
 
         if audio_output_map_label:
+            # この分岐は使用されなくなったが、念のため残す
             ffmpeg_command.extend(
                 ["-map", audio_output_map_label]
-            )  # 決定されたオーディオを出力にマッピング
-            ffmpeg_command.extend(["-c:a", "aac", "-b:a", "192k"])  # オーディオコーデック (AAC推奨)
-            # ffmpeg_command.extend(["-ac", "2"]) # 必要ならチャンネル数を指定 (amixは自動で調整するはず)
+            )
+            ffmpeg_command.extend(["-c:a", "aac", "-b:a", "192k"])
+        elif len(audio_inputs_for_filter) > 0:
+            # オーディオがある場合のコーデック設定
+            ffmpeg_command.extend(["-c:a", "aac", "-b:a", "192k"])
 
         # ffmpeg_command.extend(["-shortest"]) # オプション: 最も短い入力に合わせて出力を終了
         ffmpeg_command.extend([self.output_filename_final])  # 出力ファイル
