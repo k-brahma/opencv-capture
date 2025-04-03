@@ -10,25 +10,6 @@ import pyautogui
 import sounddevice as sd
 from flask import Flask, jsonify, render_template, request, send_from_directory
 
-# --- 修正: 使用する Host API を MME に明示的に指定 ---
-try:
-    mme_index = -1
-    host_apis = sd.query_hostapis()
-    for i, api_info in enumerate(host_apis):
-        # api_info が辞書であることを確認してからアクセス
-        if isinstance(api_info, dict) and api_info.get("name") == "MME":
-            mme_index = i
-            break
-    if mme_index != -1:
-        logging.info(f"Setting default Host API to MME (index: {mme_index})")
-        # sd.default.hostapi への代入が正しい方法
-        sd.default.hostapi = mme_index
-    else:
-        logging.warning("MME Host API not found. Using default Host API.")
-except Exception as e:
-    logging.warning(f"Error setting Host API to MME: {e}. Using default Host API.")
-# --- ここまで修正 ---
-
 # Import the Recorder class
 from media_utils.recorder import Recorder
 
@@ -176,109 +157,92 @@ class RecordingRequestHandler:
         )
 
     def determine_audio_settings(self):
-        """マイクとステレオミキサーのオーディオデバイス設定を決定する。"""
-        logging.debug("Determining audio settings for Mic and System Audio...")
+        """マイクとステレオミキサーのオーディオデバイス設定を MME API から名前で検索して決定する。"""
+        logging.debug("Determining audio settings by searching MME devices by name...")
+        self.mic_device_index = None
+        self.sys_device_index = None
+        self.mic_samplerate = Recorder.DEFAULT_SAMPLERATE
+        self.mic_channels = 1
+        self.sys_samplerate = Recorder.DEFAULT_SAMPLERATE
+        self.sys_channels = 2
 
-        # --- マイク設定 (MME Index 1 を試行、なければデフォルト) ---
-        mic_target_index = 1
-        mic_found = False
         try:
-            device_info_raw = sd.query_devices(mic_target_index, "input")
-            device_info = device_info_raw if isinstance(device_info_raw, dict) else None
-            if device_info:
-                self.mic_samplerate = int(
-                    device_info.get("default_samplerate", Recorder.DEFAULT_SAMPLERATE)
-                )
-                self.mic_channels = (
-                    2 if device_info.get("max_input_channels", 0) >= 2 else 1
-                )  # マイクは通常1か2
-                self.mic_device_index = mic_target_index
-                mic_found = True
-                logging.info(
-                    f"Found Mic device ({device_info.get('name', 'N/A')}) with index {self.mic_device_index}: "
-                    f"{self.mic_samplerate} Hz, {self.mic_channels} channels."
-                )
-            else:
-                logging.warning(
-                    f"Mic target device index {mic_target_index} not found or invalid format."
-                )
-        except (ValueError, sd.PortAudioError) as e:
-            logging.warning(
-                f"Could not query mic target device index {mic_target_index}: {e}. Trying default."
-            )
+            mme_api_index = -1
+            host_apis = sd.query_hostapis()
+            for i, api_info in enumerate(host_apis):
+                if isinstance(api_info, dict) and api_info.get("name") == "MME":
+                    mme_api_index = i
+                    logging.info(f"Found MME Host API at index: {mme_api_index}")
+                    break
+            if mme_api_index == -1:
+                logging.error("MME Host API not found. Cannot select specific MME devices.")
+                return
 
-        if not mic_found:
-            try:
-                default_device_info_raw = sd.query_devices(kind="input")
-                default_device_info = (
-                    default_device_info_raw if isinstance(default_device_info_raw, dict) else None
-                )
-                if default_device_info:
-                    self.mic_samplerate = int(
-                        default_device_info.get("default_samplerate", Recorder.DEFAULT_SAMPLERATE)
-                    )
-                    self.mic_channels = (
-                        2 if default_device_info.get("max_input_channels", 0) >= 2 else 1
-                    )
-                    self.mic_device_index = None  # Default device
-                    logging.info(
-                        f"Using default Mic device ({default_device_info.get('name', 'N/A')}): "
-                        f"{self.mic_samplerate} Hz, {self.mic_channels} channels."
-                    )
-                else:
-                    logging.warning(
-                        "Default input device not found or invalid format. Mic recording might fail."
-                    )
-                    self.mic_samplerate = Recorder.DEFAULT_SAMPLERATE
-                    self.mic_channels = 1  # Fallback
-                    self.mic_device_index = None
-            except Exception as e_fallback:
-                logging.error(
-                    f"Could not query default input device: {e_fallback}. Using fallback for Mic."
-                )
-                self.mic_samplerate = Recorder.DEFAULT_SAMPLERATE
-                self.mic_channels = 1  # Fallback
-                self.mic_device_index = None
+            all_devices = sd.query_devices()
+            if not isinstance(all_devices, list):
+                all_devices = [all_devices] if isinstance(all_devices, dict) else []
 
-        # --- ステレオミキサー設定 (MME Index 2 を試行) ---
-        sys_target_index = 2
-        sys_found = False
-        try:
-            device_info_raw = sd.query_devices(sys_target_index, "input")
-            device_info = device_info_raw if isinstance(device_info_raw, dict) else None
-            if device_info:
-                self.sys_samplerate = int(
-                    device_info.get("default_samplerate", Recorder.DEFAULT_SAMPLERATE)
-                )
-                self.sys_channels = (
-                    2 if device_info.get("max_input_channels", 0) >= 2 else 1
-                )  # ステミキは通常2
-                self.sys_device_index = sys_target_index
-                sys_found = True
-                logging.info(
-                    f"Found System Audio device (Stereo Mixer?) ({device_info.get('name', 'N/A')}) with index {self.sys_device_index}: "
-                    f"{self.sys_samplerate} Hz, {self.sys_channels} channels."
-                )
-            else:
+            mic_found_name = None
+            sys_found_name = None
+
+            for device_info in all_devices:
+                if not isinstance(device_info, dict):
+                    continue
+
+                # MME API に属し、入力チャンネルを持つデバイスのみを対象とする
+                if (
+                    device_info.get("hostapi") == mme_api_index
+                    and device_info.get("max_input_channels", 0) > 0
+                ):
+                    current_index = device_info.get("index")
+                    device_name = device_info.get("name", "")
+                    device_name_lower = device_name.lower()  # 検索用に小文字化
+                    default_sr = device_info.get("default_samplerate", Recorder.DEFAULT_SAMPLERATE)
+                    max_ch = device_info.get("max_input_channels", 0)
+
+                    # マイクを探す (より具体的に "Microphone Array" を含むか？ または "マイク")
+                    # 注意: この名前はユーザー環境依存！
+                    if self.mic_device_index is None and (
+                        "microphone array" in device_name_lower  # AMD Mic Array
+                        or "マイク" in device_name  # 一般的な"マイク"
+                        # 他にも候補があれば追加 (例: 'usb audio')
+                    ):
+                        self.mic_device_index = current_index
+                        self.mic_samplerate = int(default_sr)
+                        self.mic_channels = 2 if max_ch >= 2 else 1
+                        mic_found_name = device_name
+                        logging.info(
+                            f"Found Mic device via MME Name Search: '{mic_found_name}' (Index: {self.mic_device_index}, SR: {self.mic_samplerate}, Ch: {self.mic_channels})"
+                        )
+
+                    # ステレオミキサーを探す ("Stereo Mix" または "ステレオ ミキサー")
+                    elif self.sys_device_index is None and (
+                        "stereo mix" in device_name_lower
+                        or "ステレオ ミキサー" in device_name_lower
+                    ):
+                        self.sys_device_index = current_index
+                        self.sys_samplerate = int(default_sr)
+                        self.sys_channels = 2 if max_ch >= 2 else 1
+                        sys_found_name = device_name
+                        logging.info(
+                            f"Found System Audio device via MME Name Search: '{sys_found_name}' (Index: {self.sys_device_index}, SR: {self.sys_samplerate}, Ch: {self.sys_channels})"
+                        )
+
+                # 両方見つかったらループを抜ける
+                if self.mic_device_index is not None and self.sys_device_index is not None:
+                    break
+
+            # 見つからなかった場合のログ
+            if self.mic_device_index is None:
+                logging.warning("Could not find a suitable Mic device using MME API by name.")
+            if self.sys_device_index is None:
                 logging.warning(
-                    f"System Audio target device index {sys_target_index} not found or invalid format. System audio recording might fail."
+                    "Could not find a suitable Stereo Mixer device using MME API by name. System audio will not be recorded."
                 )
-                self.sys_samplerate = None  # Mark as not found
-                self.sys_channels = None
-                self.sys_device_index = None
-        except (ValueError, sd.PortAudioError) as e:
-            logging.warning(
-                f"Could not query system audio target device index {sys_target_index}: {e}. System audio recording will be disabled."
-            )
-            self.sys_samplerate = None  # Mark as not found
-            self.sys_channels = None
-            self.sys_device_index = None
-        except Exception as e_gen:
-            logging.error(
-                f"Unexpected error querying system audio device index {sys_target_index}: {e_gen}. System audio recording will be disabled."
-            )
-            self.sys_samplerate = None  # Mark as not found
-            self.sys_channels = None
+
+        except Exception as e:
+            logging.exception(f"Error occurred during audio device determination: {e}")
+            self.mic_device_index = None
             self.sys_device_index = None
 
     def prepare_recorder_args(self):
@@ -306,35 +270,26 @@ class RecordingRequestHandler:
             raise ValueError(
                 "ファイル名が生成されていません。generate_filenames() を先に呼び出してください。"
             )
-        if self.mic_samplerate is None or self.mic_channels is None:
-            # マイクが見つからないのは致命的ではないかもしれないが、警告は出す
+        # オーディオ設定のチェック (見つからなくても Recorder 側で処理するので ValueError は発生させない)
+        if self.mic_device_index is None:
             logging.warning(
-                "Mic audio settings not determined. Recorder might not record microphone."
+                "Mic audio device index not determined. Mic recording might fail or use default."
             )
-            # raise ValueError("マイクのオーディオ設定が決定されていません。determine_audio_settings() を先に呼び出してください。")
-
-        # システム音声はオプション扱いにする (見つからなければ None のまま渡す)
         if self.sys_device_index is None:
             logging.warning(
-                "System audio device not found or failed to query. System audio will not be recorded."
+                "System audio device index not determined. System audio will not be recorded."
             )
 
         recorder_args = {
             "video_filename_temp": self.temp_video_file,
             "mic_audio_filename_temp": self.temp_mic_audio_file,
             "sys_audio_filename_temp": self.temp_sys_audio_file,
-            "mic_device_index": self.mic_device_index,
-            "mic_samplerate": (
-                self.mic_samplerate if self.mic_samplerate else Recorder.DEFAULT_SAMPLERATE
-            ),  # Noneならデフォルト値
-            "mic_channels": self.mic_channels if self.mic_channels else 1,  # Noneならデフォルト値
-            "sys_device_index": self.sys_device_index,  # 見つからなければ None
-            "sys_samplerate": (
-                self.sys_samplerate if self.sys_samplerate else Recorder.DEFAULT_SAMPLERATE
-            ),  # Noneならデフォルト値
-            "sys_channels": (
-                self.sys_channels if self.sys_channels else 2
-            ),  # Noneならデフォルト値 (ステミキ想定)
+            "mic_device_index": self.mic_device_index,  # None でも渡す
+            "mic_samplerate": self.mic_samplerate,
+            "mic_channels": self.mic_channels,
+            "sys_device_index": self.sys_device_index,  # None でも渡す (Recorder側で判定)
+            "sys_samplerate": self.sys_samplerate,
+            "sys_channels": self.sys_channels,
             "output_filename_final": self.output_filename,
             "stop_event_ref": stop_event,
             "duration": self.duration,

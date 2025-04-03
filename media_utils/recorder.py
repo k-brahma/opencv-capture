@@ -76,10 +76,12 @@ FFmpeg の呼び出しには標準ライブラリの `subprocess` を使用し�
 * coverage (テスト用)
 """
 
+import functools  # For partial in audio callback setup
 import logging
 import os
 import queue
 import subprocess
+import sys  # For stderr in _process_output
 import threading
 import time
 
@@ -92,125 +94,11 @@ import soundfile as sf
 # --- ロガー設定 ---
 logger = logging.getLogger(__name__)
 
-# 注意: このモジュールは共有のaudio_queueとstop_eventの管理のためにapp.pyに依存しています。
-# 将来的にはクラスベースのアプローチでこれをより良くカプセル化できるかもしれません。
-
-
-# --- FFmpeg 音声変換クラス ---
-class AudioConverter:
-    """FFmpeg を使用して音声ファイルを変換する機能を提供するクラス。
-
-    主に一時的に保存された WAV ファイルを MP3 に変換する用途を想定しています。
-    (将来的には、ビデオとのマージ処理にも FFmpeg を利用する可能性があります)
-    """
-
-    def __init__(self, ffmpeg_path="ffmpeg", cleanup_temp_files=True):
-        """`AudioConverter` のインスタンスを初期化します。
-
-        :param ffmpeg_path: FFmpeg 実行可能ファイルへのパス。
-                            環境変数 PATH に含まれている場合は "ffmpeg" のままで動作します。
-        :type ffmpeg_path: str
-        :param cleanup_temp_files: 変換が成功した場合に、元の入力ファイル (WAV) を削除するかどうかを示すフラグ。
-                                   デフォルトは True (削除する)。テスト時などに False に設定すると便利です。
-        :type cleanup_temp_files: bool
-        """
-        self.ffmpeg_path = ffmpeg_path
-        self.cleanup_temp_files = cleanup_temp_files
-
-    def convert_wav_to_mp3(self, wav_path, mp3_path, bitrate="192k"):
-        """指定された WAV ファイルを MP3 ファイルに変換します。
-
-        `ffmpeg` コマンドをサブプロセスとして実行します。
-        入力ファイルが存在しないか、サイズが小さすぎる (1024 バイト以下) 場合は、
-        変換をスキップして `False` を返します。
-
-        :param wav_path: 入力となる WAV ファイルのパス。
-        :type wav_path: str
-        :param mp3_path: 出力する MP3 ファイルのパス。
-        :type mp3_path: str
-        :param bitrate: 出力 MP3 ファイルのオーディオビットレート (例: "192k", "128k")。
-                        FFmpeg の `-ab` オプションに渡されます。
-        :type bitrate: str
-        :return: 変換が成功した場合は True、スキップまたは失敗した場合は False。
-        :rtype: bool
-        :raises FileNotFoundError: `ffmpeg_path` で指定された FFmpeg コマンドが見つからない場合。
-                                 (厳密には `subprocess.run` が発生させる)
-        :raises subprocess.CalledProcessError: FFmpeg の実行がエラーで終了した場合。
-                                             (終了コードが 0 以外の場合)
-        """
-        if not os.path.exists(wav_path) or os.path.getsize(wav_path) <= 1024:
-            logger.info(f"オーディオ変換をスキップ: WAVファイルが存在しないか空です: {wav_path}")
-            return False
-
-        logger.info(
-            f"--- FFmpeg --- {wav_path} から {mp3_path} への変換を開始します (ビットレート: {bitrate})"
-        )
-        ffmpeg_command = [
-            self.ffmpeg_path,
-            "-y",
-            "-i",
-            wav_path,
-            "-vn",
-            "-acodec",
-            "libmp3lame",
-            "-ab",
-            bitrate,
-            mp3_path,
-        ]
-        success = False
-        try:
-            logger.debug(f"FFmpegコマンドを実行: {' '.join(ffmpeg_command)}")
-            startupinfo = None
-            if os.name == "nt":
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                startupinfo.wShowWindow = subprocess.SW_HIDE
-            process = subprocess.run(
-                ffmpeg_command,
-                check=True,
-                capture_output=True,
-                text=True,
-                startupinfo=startupinfo,
-            )
-            logger.info("FFmpegによるWAVからMP3への変換が成功しました！")
-            success = True
-            if self.cleanup_temp_files:
-                try:
-                    os.remove(wav_path)
-                    logger.info(f"一時的なオーディオファイルを削除しました: {wav_path}")
-                except OSError as e:
-                    logger.warning(f"一時的なオーディオファイル {wav_path} の削除中にエラー: {e}")
-                else:
-                    logger.info(f"一時ファイル削除スキップ: {wav_path}")
-
-        except subprocess.CalledProcessError as e:
-            logger.error("!!!!!!!! FFmpegによるWAVからMP3への変換が失敗しました !!!!!!!!")
-            logger.error(f"コマンド: {' '.join(e.cmd)}")
-            logger.error(f"リターンコード: {e.returncode}")
-            logger.error(f"エラー出力 (stderr):\n{e.stderr}")
-        except FileNotFoundError:
-            logger.error(f"エラー: '{self.ffmpeg_path}' コマンドが見つかりません。")
-        except Exception as e:
-            logger.exception(f"FFmpeg変換中に予期せぬエラーが発生しました: {e}")
-        finally:
-            if not success and not self.cleanup_temp_files:
-                logger.warning("変換失敗のため、一時的なWAVファイルは削除されませんでした。")
-            elif not success and self.cleanup_temp_files:
-                # cleanup_temp_files=True でも失敗時は削除しない方がデバッグしやすいかも
-                logger.warning("変換失敗のため、一時的なWAVファイルは削除されませんでした。")
-
-        return success
+# --- 削除: AudioConverter は使用しなくなるため削除 ---
 
 
 class Recorder:
-    """画面録画と音声録音のプロセスを管理・実行するクラス。
-
-    インスタンス化時に録画設定を受け取り、`start()` メソッドで録画を開始し、
-    `stop()` メソッドまたは指定された録画時間 (`duration`) に基づいて録画を停止します。
-
-    音声録音 (`_audio_record`) はバックグラウンドスレッドで実行されます。
-    画面録画 (`_screen_record`) は `start()` を呼び出したスレッドで実行されます。
-    録画停止後、後処理メソッド (`_process_output`) が呼び出されます。
+    """画面録画と複数音声（マイク、システム）録音のプロセスを管理・実行するクラス。
 
     :cvar DEFAULT_SAMPLERATE: デフォルトのオーディオサンプルレート (Hz)。
     :type DEFAULT_SAMPLERATE: int
@@ -223,174 +111,201 @@ class Recorder:
     """
 
     DEFAULT_SAMPLERATE = 44100
-    DEFAULT_CHANNELS = 1
+    DEFAULT_CHANNELS = 1  # デフォルトはモノラルだが、デバイスによって上書きされる
     DEFAULT_FPS = 30
     DEFAULT_FFMPEG_PATH = "ffmpeg"
 
     def __init__(
         self,
         video_filename_temp,
-        audio_filename_temp,
+        # --- 修正: オーディオ関連の引数をマイクとシステム音声用に変更 ---
+        mic_audio_filename_temp,
+        sys_audio_filename_temp,
+        mic_device_index,
+        mic_samplerate,
+        mic_channels,
+        sys_device_index,  # システム音声が見つからない場合は None
+        sys_samplerate,
+        sys_channels,
+        # --- ここまで修正 ---
         output_filename_final,
         stop_event_ref,
         duration=10,
         fps=DEFAULT_FPS,
         region=None,
         shorts_format=True,
-        samplerate=DEFAULT_SAMPLERATE,
-        channels=DEFAULT_CHANNELS,
-        audio_device_index=None,
         ffmpeg_path=DEFAULT_FFMPEG_PATH,
     ):
         """`Recorder` のインスタンスを初期化します。
 
         :param video_filename_temp: 画面録画データ（AVI形式）を一時的に保存するファイルパス。
         :type video_filename_temp: str
-        :param audio_filename_temp: 音声録音データ（WAV形式）を一時的に保存するファイルパス。
-        :type audio_filename_temp: str
+        :param mic_audio_filename_temp: マイク音声録音データ（WAV形式）を一時的に保存するファイルパス。
+        :type mic_audio_filename_temp: str
+        :param sys_audio_filename_temp: システム音声録音データ（WAV形式）を一時的に保存するファイルパス。
+        :type sys_audio_filename_temp: str
+        :param mic_device_index: 使用するマイク入力デバイスのインデックス。
+        :type mic_device_index: int | None
+        :param mic_samplerate: マイク音声録音のサンプルレート (Hz)。
+        :type mic_samplerate: int
+        :param mic_channels: マイク音声録音のチャンネル数。
+        :type mic_channels: int
+        :param sys_device_index: 使用するシステム音声入力デバイスのインデックス。
+        :type sys_device_index: int | None
+        :param sys_samplerate: システム音声録音のサンプルレート (Hz)。
+        :type sys_samplerate: int
+        :param sys_channels: システム音声録音のチャンネル数。
+        :type sys_channels: int
         :param output_filename_final: 最終的な出力ファイル（MP4形式を想定）のパス。
-                                     現在の実装では、`_process_output` はこのパスから
-                                     MP3 ファイル名を生成して使用します。
         :type output_filename_final: str
         :param stop_event_ref: 録画プロセスを外部から停止させるための `threading.Event` オブジェクト。
-                               `start()` 実行前に `clear()` され、`stop()` で `set()` されます。
-                               `_audio_record` と `_screen_record` のループはこのイベントを監視します。
         :type stop_event_ref: threading.Event
         :param duration: 最大録画時間（秒）。0 を指定すると `stop()` が呼ばれるまで録画を続けます。
-                         デフォルトは 10 秒。
         :type duration: int
         :param fps: 画面録画のフレームレート（フレーム/秒）。デフォルトは `Recorder.DEFAULT_FPS`。
         :type fps: int
         :param region: 画面録画を行う領域を指定するタプル `(left, top, width, height)`。
-                       `None` の場合は全画面を録画します。デフォルトは `None`。
         :type region: tuple[int, int, int, int] | None
         :param shorts_format: ショート動画形式（縦長 9:16、1080x1920）で出力するかどうか。
-                              True の場合、`_resize_and_pad_frame` によってリサイズとパディングが行われます。
-                              デフォルトは True。
         :type shorts_format: bool
-        :param samplerate: 音声録音のサンプルレート (Hz)。デフォルトは `Recorder.DEFAULT_SAMPLERATE`。
-        :type samplerate: int
-        :param channels: 音声録音のチャンネル数。デフォルトは `Recorder.DEFAULT_CHANNELS`。
-        :type channels: int
-        :param audio_device_index: 使用するオーディオ入力デバイスのインデックス。
-                                  `sounddevice` が認識するインデックスを指定します。
-                                  `None` の場合はデフォルトの入力デバイスを使用します。
-                                  デフォルトは `None`。
-        :type audio_device_index: int | None
         :param ffmpeg_path: FFmpeg 実行可能ファイルへのパス。内部の `AudioConverter` に渡されます。
-                            デフォルトは `Recorder.DEFAULT_FFMPEG_PATH`。
         :type ffmpeg_path: str
         """
         self.video_filename_temp = video_filename_temp
-        self.audio_filename_temp = audio_filename_temp
         self.output_filename_final = output_filename_final
         self.stop_event = stop_event_ref
         self.duration = duration
         self.fps = fps
         self.region = region
         self.shorts_format = shorts_format
-        self.samplerate = samplerate
-        self.channels = channels
-        self.audio_device_index = audio_device_index
         self.ffmpeg_path = ffmpeg_path
 
-        #: 音声変換処理を行うための :class:`AudioConverter` インスタンス。
-        self.converter = AudioConverter(ffmpeg_path=self.ffmpeg_path)
+        # --- 修正: マイクとシステム音声の情報を保持 ---
+        self.mic_audio_filename_temp = mic_audio_filename_temp
+        self.mic_device_index = mic_device_index
+        self.mic_samplerate = mic_samplerate
+        self.mic_channels = mic_channels
 
-        #: オーディオコールバックからデータを受け取るためのキュー。
-        self.audio_queue = queue.Queue()
-        #: オーディオ録音を実行するスレッドオブジェクト。`start()` で生成されます。
-        self.audio_recording_thread = None
+        self.sys_audio_filename_temp = sys_audio_filename_temp
+        self.sys_device_index = sys_device_index
+        self.sys_samplerate = sys_samplerate
+        self.sys_channels = sys_channels
+        # システム音声デバイスが見つからない (index is None) 場合は録音しないフラグ
+        self.record_sys_audio = self.sys_device_index is not None
+
+        #: オーディオコールバックからマイクデータを受け取るキュー。
+        self.mic_audio_queue = queue.Queue()
+        #: オーディオコールバックからシステム音声データを受け取るキュー。
+        self.sys_audio_queue = queue.Queue() if self.record_sys_audio else None
+
+        #: マイク音声録音を実行するスレッドオブジェクト。
+        self.mic_audio_thread = None
+        #: システム音声録音を実行するスレッドオブジェクト。
+        self.sys_audio_thread = None
+        # --- ここまで修正 ---
+
         #: 画面録画が正常に完了したかどうかを示すフラグ。
-        #: (現在は `_screen_record` の最後に True に設定されるのみ)
         self.video_success = False
+        #: マイク録音が正常に完了したか（ファイルが生成され、データが書き込まれたか）
+        self.mic_audio_success = False
+        #: システム音声録音が正常に完了したか
+        self.sys_audio_success = False
 
-    def _audio_callback(self, indata, frames, time, status):
+    def _audio_callback(self, indata, frames, time, status, target_queue):
         """`sounddevice.InputStream` から呼び出されるコールバック関数。
 
-        受け取ったオーディオデータ (`indata`) のコピーを `self.audio_queue` に追加します。
-        ステータス情報があればコンソールに出力します。
-        このメソッドはオーディオ入力スレッドのコンテキストで実行されます。
-
-        :param indata: 録音されたオーディオデータを含む NumPy 配列。
-                       形状は `(frames, channels)`。
-        :type indata: numpy.ndarray
-        :param frames: `indata` に含まれるフレーム数。
-        :type frames: int
-        :param time: コールバックが呼び出された時刻情報 (詳細は sounddevice ドキュメント参照)。
-                     このメソッド内では現在使用されていません。
-        :type time: ???
-        :param status: ストリームの状態を示すフラグ (詳細は sounddevice ドキュメント参照)。
-                       問題が発生した場合 (例: オーバーフロー) に情報が含まれます。
-        :type status: sounddevice.CallbackFlags
+        指定されたキュー (`target_queue`) にデータを追加します。
         """
         if status:
-            print(status, flush=True)
-        self.audio_queue.put(indata.copy())
+            logger.warning(f"Audio Callback Status: {status}")
+        # --- 修正: 指定されたキューにデータを追加 ---
+        if target_queue:
+            target_queue.put(indata.copy())
+        # --- ここまで修正 ---
 
-    def _audio_record(self):
-        """オーディオデバイスから録音を開始し、一時 WAV ファイルに書き込む内部メソッド。
+    # --- 新規: 汎用的な単一オーディオストリーム録音メソッド ---
+    def _record_single_audio_stream(
+        self, device_index, samplerate, channels, target_queue, temp_filename
+    ):
+        """指定されたデバイスから録音し、一時ファイルに書き込む内部メソッド。
 
-        `start()` メソッドからバックグラウンドスレッドで実行されることを想定しています。
-        `sounddevice.InputStream` を開き、`_audio_callback` を登録します。
-        `self.stop_event` がセットされるまで、`self.audio_queue` からデータを取得し、
-        `soundfile.SoundFile` を使って一時 WAV ファイルに書き込み続けます。
-
-        :raises sd.PortAudioError: 指定されたオーディオデバイスが開けないなど、PortAudio関連のエラーが発生した場合。
-        :raises ValueError: 指定された `audio_device_index` やパラメータが無効な場合。
-        :raises Exception: その他の予期せぬエラー (ファイル書き込みエラーなど)。
+        バックグラウンドスレッドで実行されることを想定。
+        :return: 録音に成功したか (ファイルが生成され、データが書き込まれたか) どうかの bool 値
         """
-        logger.info(f"オーディオ録音開始: {self.audio_filename_temp}")
+        success_flag = False
+        stream = None  # finally で使うために外で宣言
+        file = None  # finally で使うために外で宣言
+        logger.info(f"オーディオ録音開始 (Device: {device_index}): {temp_filename}")
         try:
-            device_info = sd.query_devices(self.audio_device_index, "input")
-            logger.debug(f"選択されたデバイス情報: {device_info.get('name', 'N/A')}")  # type: ignore
-            actual_samplerate = int(device_info.get("default_samplerate", 0))  # type: ignore
-            actual_channels = int(device_info.get("max_input_channels", 0))  # type: ignore
-            logger.debug(
-                f"デバイスがサポートするサンプルレート: {actual_samplerate}, 最大チャンネル数: {actual_channels}"
+            # mode='w' は追記ではなく上書き。一時ファイルなのでこれで良い。
+            file = sf.SoundFile(
+                temp_filename,
+                mode="w",
+                samplerate=samplerate,
+                channels=channels,
+                format="WAV",
             )
-            logger.debug(
-                f"使用するサンプルレート: {self.samplerate}, チャンネル数: {self.channels}"
-            )
+            # functools.partial を使ってコールバックに関数を部分適用する
+            callback_with_queue = functools.partial(self._audio_callback, target_queue=target_queue)
 
-            # soundfile で一時 WAV ファイルを開く (追記ではなく新規作成: mode='xb')
-            with sf.SoundFile(
-                self.audio_filename_temp,
-                mode="xb",
-                samplerate=self.samplerate,
-                channels=self.channels,
-                format="WAV",  # 明示的にWAVフォーマットを指定
-            ) as file:
-                # sounddevice で入力ストリームを開く (エラーがあれば PortAudioError)
-                with sd.InputStream(
-                    samplerate=self.samplerate,
-                    channels=self.channels,
-                    callback=self._audio_callback,  # データ受信時のコールバックを登録
-                    device=self.audio_device_index,  # 使用するデバイスインデックス
-                ):
-                    # 停止イベントがセットされるまでループ
+            stream = sd.InputStream(
+                samplerate=samplerate,
+                channels=channels,
+                callback=callback_with_queue,
+                device=device_index,
+            )
+            stream.start()  # ストリームを開始
+            logger.info(f"オーディオストリーム開始 (Device: {device_index})")
+
                     while not self.stop_event.is_set():
                         try:
-                            # キューからデータを取得 (タイムアウト付き)
-                            # タイムアウト (queue.Empty) は無視してループを継続
-                            data = self.audio_queue.get(timeout=0.1)
-                            # 取得したデータをファイルに書き込み
+                    # キューからデータを取得し、ファイルに書き込む
+                    data = target_queue.get(timeout=0.1)
                             file.write(data)
+                    # 最初の書き込みが成功したらフラグを立てる (ファイルが空でなくなる目安)
+                    if not success_flag:
+                        success_flag = True
                         except queue.Empty:
-                            # キューが空でも stop_event をチェックするためループ継続
-                            pass
-        except sd.PortAudioError as e:
-            logger.error(f"デバイス {self.audio_device_index} の選択時にPortAudioエラーが発生: {e}")
-        except ValueError as e:
+                    # タイムアウトは正常なので無視してループ継続
+                    pass
+                except Exception as write_e:
+                    logger.error(f"Error writing audio data to {temp_filename}: {write_e}")
+                    # 書き込みエラーが発生したらループを抜けるか？ -> 一旦継続
+
+        except sd.PortAudioError as pae:
             logger.error(
-                f"無効なデバイスインデックス {self.audio_device_index} またはパラメータ: {e}"
+                f"PortAudioError starting stream on device {device_index} ({temp_filename}): {pae}"
             )
+            success_flag = False
         except Exception as e:
-            # ファイルオープン失敗などもここに含まれる可能性
-            logger.exception(f"オーディオ録音エラー: {e}")
+            logger.exception(
+                f"予期せぬオーディオ録音エラー (Device: {device_index}, File: {temp_filename}): {e}"
+            )
+            success_flag = False
         finally:
-            # 正常終了、エラー発生に関わらず最後に実行
-            logger.info(f"オーディオ録音停止: {self.audio_filename_temp}")
+            # ストリームとファイルを確実に閉じる
+            if stream is not None:
+                try:
+                    if not stream.closed:
+                        stream.stop()
+                        stream.close()
+                        logger.debug(f"Audio stream closed for device {device_index}.")
+                except Exception as close_e:
+                    logger.error(f"Error closing audio stream for device {device_index}: {close_e}")
+            if file is not None:
+                try:
+                    file.close()
+                    logger.debug(f"Audio file closed: {temp_filename}")
+                except Exception as file_close_e:
+                    logger.error(f"Error closing audio file {temp_filename}: {file_close_e}")
+
+            logger.info(
+                f"オーディオ録音停止 (Device: {device_index}, Success: {success_flag}): {temp_filename}"
+            )
+            # 成功フラグ（データが書き込まれたか）を返す
+            return success_flag
+
+    # --- ここまで新規メソッド ---
 
     def _resize_and_pad_frame(self, frame, target_size, shorts_format):
         """キャプチャしたフレームを指定された出力サイズに合わせてリサイズ・パディングする内部メソッド。
@@ -418,11 +333,9 @@ class Recorder:
             target_aspect = target_w / target_h  # e.g., 1080 / 1920 = 0.5625
 
             if source_aspect > target_aspect:  # ソースがターゲットより横長 (例: 16:9 > 9:16)
-                # 横幅をターゲットに合わせ、縦幅を計算してリサイズ
                 new_w = target_w
                 new_h = int(new_w / source_aspect)
                 resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                # 上下に黒帯を追加
                 pad_v = target_h - new_h
                 pad_top = pad_v // 2
                 pad_bottom = pad_v - pad_top
@@ -430,11 +343,9 @@ class Recorder:
                     resized, pad_top, pad_bottom, 0, 0, cv2.BORDER_CONSTANT, value=[0, 0, 0]
                 )
             elif source_aspect < target_aspect:  # ソースがターゲットより縦長 (例: 1:2 < 9:16)
-                # 縦幅をターゲットに合わせ、横幅を計算してリサイズ
                 new_h = target_h
                 new_w = int(new_h * source_aspect)
                 resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                # 左右に黒帯を追加
                 pad_h = target_w - new_w
                 pad_left = pad_h // 2
                 pad_right = pad_h - pad_left
@@ -442,14 +353,11 @@ class Recorder:
                     resized, 0, 0, pad_left, pad_right, cv2.BORDER_CONSTANT, value=[0, 0, 0]
                 )
             else:  # アスペクト比が同じ (例: 9:16 == 9:16)
-                # 単純にターゲットサイズにリサイズ
                 final_frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
             return final_frame
         else:
-            # shorts_format=False の場合: target_size (録画領域サイズ) に単純リサイズ
             current_h, current_w = frame.shape[:2]
             if current_w != output_width or current_h != output_height:
-                # サイズが異なる場合のみリサイズ実行
                 frame = cv2.resize(
                     frame, (output_width, output_height), interpolation=cv2.INTER_AREA
                 )
@@ -541,131 +449,164 @@ class Recorder:
     def _process_output(self):
         """録画停止後の後処理を実行する内部メソッド。
 
-        一時 AVI ビデオファイルと一時 WAV オーディオファイルを FFmpeg でマージし、
-        `self.output_filename_final` (MP4) として保存します。
-        マージ成功後に一時ファイル (AVI, WAV) を削除します。
-        ビデオ録画 (`self.video_success`) またはオーディオ録音に問題があった場合は、
-        マージ処理をスキップします。
+        ビデオファイル、マイク音声ファイル、システム音声ファイルを FFmpeg でマージし、
+        最終的な MP4 ファイルとして保存します。
         """
         logger.info("録画後処理を開始します...")
 
-        # ビデオ録画が成功し、かつ有効なオーディオファイルが存在するか確認
-        audio_file_valid = (
-            os.path.exists(self.audio_filename_temp)
-            and os.path.getsize(self.audio_filename_temp) > 1024  # ある程度のサイズがあるか
+        # --- 入力ファイルの存在と有効性を確認 ---
+        # video_success は _screen_record 内で設定される
+        video_valid = self.video_success and os.path.exists(self.video_filename_temp)
+        # 各音声の success フラグは _record_single_audio_stream の戻り値で設定される
+        mic_audio_valid = (
+            self.mic_audio_success
+            and os.path.exists(self.mic_audio_filename_temp)
+            and os.path.getsize(self.mic_audio_filename_temp) > 1024
+        )
+        sys_audio_valid = (
+            self.record_sys_audio
+            and self.sys_audio_success
+            and os.path.exists(self.sys_audio_filename_temp)
+            and os.path.getsize(self.sys_audio_filename_temp) > 1024
         )
 
-        if not self.video_success:
-            logger.warning("ビデオ録画に失敗したため、マージ処理をスキップします。")
-            # ビデオ失敗時はオーディオファイルも不要なことが多いので削除を試みる
-            if os.path.exists(self.audio_filename_temp):
-                try:
-                    os.remove(self.audio_filename_temp)
-                    logger.info(
-                        f"未使用の一時オーディオファイルを削除しました: {self.audio_filename_temp}"
-                    )
-                except OSError as e:
-                    logger.warning(
-                        f"一時オーディオファイル {self.audio_filename_temp} の削除中にエラー: {e}"
-                    )
-            return  # マージは行わない
+        if not video_valid:
+            logger.warning("ビデオ録画に失敗またはファイルが見つからないため、処理を中止します。")
+            # 残っている一時音声ファイルがあれば削除
+            if os.path.exists(self.mic_audio_filename_temp):
+                os.remove(self.mic_audio_filename_temp)
+            if self.record_sys_audio and os.path.exists(self.sys_audio_filename_temp):
+                os.remove(self.sys_audio_filename_temp)
+            return
 
-        if not audio_file_valid:
-            logger.warning("有効なオーディオファイルが存在しないため、マージ処理をスキップします。")
-            # --- 修正: 音声なしでもビデオを保存 ---
-            if os.path.exists(self.video_filename_temp):
-                logger.info(
-                    f"音声がないため、一時ビデオファイル {self.video_filename_temp} を {self.output_filename_final} にリネームします。"
-                )
-                try:
-                    # 既存の同名ファイルがあれば削除 (念のため)
-                    if os.path.exists(self.output_filename_final):
-                        os.remove(self.output_filename_final)
-                    os.rename(self.video_filename_temp, self.output_filename_final)
-                    logger.info("ビデオのみのファイルの保存に成功しました。")
-                except OSError as e:
-                    logger.error(f"一時ビデオファイルのリネーム中にエラー: {e}")
-                    # リネーム失敗時は一時ファイルを削除しない方がデバッグしやすいかも
-                    # logger.warning(f"リネーム失敗のため一時ビデオファイルを削除します: {self.video_filename_temp}")
-                    # try:
-                    #     os.remove(self.video_filename_temp)
-                    # except OSError as e_rem:
-                    #     logger.error(f"一時ビデオファイルの削除にも失敗: {e_rem}")
-            else:
-                logger.warning("音声ファイルがなく、一時ビデオファイルも見つかりませんでした。")
-            return  # マージは行わない
+        # --- FFmpeg コマンドの構築 ---
+        ffmpeg_command = [self.ffmpeg_path, "-y"]  # 出力上書き
 
-        # --- FFmpeg によるマージ処理 ---
-        logger.info(f"ビデオとオーディオのマージを開始: {self.output_filename_final}")
-        merge_command = [
-            self.ffmpeg_path,
-            "-y",  # 出力ファイルを上書き
-            "-i",
-            self.video_filename_temp,  # 入力ビデオ
-            "-i",
-            self.audio_filename_temp,  # 入力オーディオ
-            "-c:v",
-            "copy",  # ビデオコーデックをコピー (再エンコードしない)
-            "-c:a",
-            "aac",  # オーディオコーデックをAACにエンコード
-            "-strict",
-            "experimental",  # 古いFFmpegでのAAC互換性用 (不要な場合もある)
-            "-map",
-            "0:v:0",  # 最初の入力 (ビデオ) のビデオストリームを選択
-            "-map",
-            "1:a:0",  # 2番目の入力 (オーディオ) のオーディオストリームを選択
-            self.output_filename_final,  # 出力ファイルパス
-        ]
+        # 入力ファイルの追加 (ビデオは常に最初)
+        ffmpeg_command.extend(["-i", self.video_filename_temp])
+        input_map = {"video": "0:v:0"}
+        audio_inputs_for_filter = []
+        input_count = 1  # 次の入力ファイルのインデックス (0はビデオ)
+
+        if mic_audio_valid:
+            ffmpeg_command.extend(["-i", self.mic_audio_filename_temp])
+            input_map["mic_audio"] = f"{input_count}:a:0"
+            audio_inputs_for_filter.append(f"[{input_count}:a]")
+            input_count += 1
+            logger.info("マイク音声をマージ対象に追加します。")
+        else:
+            logger.warning("マイク音声が無効または見つからないため、マージから除外します。")
+
+        if sys_audio_valid:
+            ffmpeg_command.extend(["-i", self.sys_audio_filename_temp])
+            input_map["sys_audio"] = f"{input_count}:a:0"
+            audio_inputs_for_filter.append(f"[{input_count}:a]")
+            input_count += 1
+            logger.info("システム音声をマージ対象に追加します。")
+        else:
+            # record_sys_audio が False の場合もここに該当
+            logger.info("システム音声は録音されなかったか無効なため、マージから除外します。")
+
+        # オーディオフィルターとマッピングの決定
+        audio_output_map_label = None
+        if len(audio_inputs_for_filter) >= 2:
+            # 2つ以上の有効なオーディオ入力がある場合 -> amix でミックス
+            filter_complex = f"{''.join(audio_inputs_for_filter)}amix=inputs={len(audio_inputs_for_filter)}:duration=longest[a_mix]"
+            ffmpeg_command.extend(["-filter_complex", filter_complex])
+            audio_output_map_label = "[a_mix]"  # ミックスされたオーディオを出力にマッピング
+            logger.info(
+                f"{len(audio_inputs_for_filter)} 個のオーディオストリームをミックスします。"
+            )
+        elif len(audio_inputs_for_filter) == 1:
+            # 有効なオーディオ入力が1つだけの場合 -> フィルター不要、直接マッピング
+            # input_map から該当するマッピング ("1:a:0" など) を取得
+            if mic_audio_valid:
+                audio_output_map_label = input_map["mic_audio"]
+            elif sys_audio_valid:
+                audio_output_map_label = input_map["sys_audio"]
+            logger.info("1個のオーディオストリームを直接マッピングします。")
+        else:
+            # 有効なオーディオ入力がない場合
+            logger.warning("有効なオーディオ入力がないため、音声なし (-an) で処理します。")
+            ffmpeg_command.extend(["-an"])  # オーディオなし
+
+        # マッピング指定とコーデック設定
+        ffmpeg_command.extend(["-map", input_map["video"]])  # ビデオストリームは常にマッピング
+        ffmpeg_command.extend(["-c:v", "copy"])  # ビデオはコピー
+
+        if audio_output_map_label:
+            ffmpeg_command.extend(
+                ["-map", audio_output_map_label]
+            )  # 決定されたオーディオを出力にマッピング
+            ffmpeg_command.extend(["-c:a", "aac", "-b:a", "192k"])  # オーディオコーデック (AAC推奨)
+            # ffmpeg_command.extend(["-ac", "2"]) # 必要ならチャンネル数を指定 (amixは自動で調整するはず)
+
+        # ffmpeg_command.extend(["-shortest"]) # オプション: 最も短い入力に合わせて出力を終了
+        ffmpeg_command.extend([self.output_filename_final])  # 出力ファイル
+
+        # --- FFmpeg 実行 ---
+        logger.info(f"FFmpeg マージコマンドを実行します:")
+        # コマンドが見やすいようにスペースで連結して表示 (デバッグ用)
+        logger.info(" ".join(ffmpeg_command))
         merge_success = False
         try:
-            logger.debug(f"FFmpegマージコマンドを実行: {' '.join(merge_command)}")
             startupinfo = None
-            if os.name == "nt":  # Windowsの場合、コンソールウィンドウを非表示に
+            if os.name == "nt":
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 startupinfo.wShowWindow = subprocess.SW_HIDE
-
             process = subprocess.run(
-                merge_command,
-                check=True,  # エラーコードが0以外なら例外発生
-                capture_output=True,  # 標準出力/エラーをキャプチャ
-                text=True,  # テキストモードでキャプチャ
+                ffmpeg_command,
+                check=True,
+                capture_output=True,
+                text=True,
                 startupinfo=startupinfo,
+                encoding="utf-8",
+                errors="ignore",
             )
             logger.info(f"FFmpegによるマージが成功しました！ 出力: {self.output_filename_final}")
-            logger.debug(f"FFmpeg stdout:\n{process.stdout}")
-            logger.debug(f"FFmpeg stderr:\n{process.stderr}")
+            logger.debug(f"FFmpeg stderr:\n{process.stderr}")  # stderr は通常進捗など
             merge_success = True
         except subprocess.CalledProcessError as e:
             logger.error("!!!!!!!! FFmpegによるマージ処理が失敗しました !!!!!!!!")
             logger.error(f"コマンド: {' '.join(e.cmd)}")
             logger.error(f"リターンコード: {e.returncode}")
-            logger.error(f"エラー出力 (stderr):\n{e.stderr}")
+            logger.error(f"エラー出力 (stderr):\n{e.stderr}")  # エラー内容
         except FileNotFoundError:
-            logger.error(
-                f"エラー: '{self.ffmpeg_path}' コマンドが見つかりません。FFmpegがインストールされ、PATHに含まれているか確認してください。"
-            )
+            logger.error(f"エラー: '{self.ffmpeg_path}' コマンドが見つかりません。")
         except Exception as e:
             logger.exception(f"FFmpegマージ中に予期せぬエラーが発生しました: {e}")
 
         # --- 一時ファイルのクリーンアップ ---
+        # 成功・失敗に関わらず、存在する一時ファイルリストを作成
+        temp_files_to_remove = []
+        if os.path.exists(self.video_filename_temp):
+            temp_files_to_remove.append(self.video_filename_temp)
+        if os.path.exists(self.mic_audio_filename_temp):
+            temp_files_to_remove.append(self.mic_audio_filename_temp)
+        # sys_audio_filename_temp は record_sys_audio が True の場合のみ考慮
+        if self.record_sys_audio and os.path.exists(self.sys_audio_filename_temp):
+            temp_files_to_remove.append(self.sys_audio_filename_temp)
+
         if merge_success:
             logger.info("マージ成功のため、一時ファイルを削除します。")
-            try:
-                if os.path.exists(self.video_filename_temp):
-                    os.remove(self.video_filename_temp)
-                    logger.debug(f"一時ビデオファイルを削除しました: {self.video_filename_temp}")
-                if os.path.exists(self.audio_filename_temp):
-                    os.remove(self.audio_filename_temp)
-                    logger.debug(
-                        f"一時オーディオファイルを削除しました: {self.audio_filename_temp}"
-                    )
+            for f in temp_files_to_remove:
+                try:
+                    # ここでは再度 exists チェックは不要 (リスト作成時に確認済み)
+                    os.remove(f)
+                    logger.debug(f"一時ファイルを削除しました: {f}")
             except OSError as e:
-                logger.warning(f"マージ成功後の一時ファイル削除中にエラー: {e}")
+                    logger.warning(f"一時ファイル {f} の削除中にエラー: {e}")
         else:
-            logger.warning("マージに失敗したため、一時ファイルは削除されませんでした。")
-            logger.warning(f"一時ビデオ: {self.video_filename_temp}")
-            logger.warning(f"一時オーディオ: {self.audio_filename_temp}")
+                logger.warning(
+                "マージに失敗またはスキップされたため、一時ファイルは削除されませんでした。"
+            )
+            if temp_files_to_remove:
+                logger.warning("以下のファイルを確認してください:")
+                for f in temp_files_to_remove:
+                    logger.warning(f"  - {f}")
+            else:
+                logger.warning("(削除対象の一時ファイルはありませんでした)")
 
         logger.info("録画後処理が完了しました。")
 
@@ -681,29 +622,84 @@ class Recorder:
         """
         logger.info("レコーダー開始中...")
         self.stop_event.clear()
+        self.video_success = False  # リセット
+        self.mic_audio_success = False
+        self.sys_audio_success = False
 
-        # オーディオ録音スレッドの準備と開始
-        self.audio_recording_thread = threading.Thread(target=self._audio_record, daemon=True)
-        self.audio_recording_thread.start()
+        # --- 修正: 2つのオーディオスレッドを開始 ---
+        self.mic_audio_thread = threading.Thread(
+            target=lambda: setattr(
+                self,
+                "mic_audio_success",
+                self._record_single_audio_stream(
+                    device_index=self.mic_device_index,
+                    samplerate=self.mic_samplerate,
+                    channels=self.mic_channels,
+                    target_queue=self.mic_audio_queue,
+                    temp_filename=self.mic_audio_filename_temp,
+                ),
+            ),
+            daemon=True,
+            name="MicAudioThread",  # スレッドに名前をつける
+        )
+        self.mic_audio_thread.start()
+        logger.debug("マイクオーディオスレッドを開始しました。")
+
+        if self.record_sys_audio and self.sys_audio_queue:
+            self.sys_audio_thread = threading.Thread(
+                target=lambda: setattr(
+                    self,
+                    "sys_audio_success",
+                    self._record_single_audio_stream(
+                        device_index=self.sys_device_index,
+                        samplerate=self.sys_samplerate,
+                        channels=self.sys_channels,
+                        target_queue=self.sys_audio_queue,
+                        temp_filename=self.sys_audio_filename_temp,
+                    ),
+                ),
+                daemon=True,
+                name="SysAudioThread",
+            )
+            self.sys_audio_thread.start()
+            logger.debug("システムオーディオスレッドを開始しました。")
+        else:
+            logger.info("システム音声録音はスキップされます。")
+            self.sys_audio_thread = None
+        # --- ここまで修正 ---
 
         # 画面録画を開始 (ブロッキング)
         self._screen_record()
 
         # --- 録画後の処理 ---
-        # 画面録画が終わったら、オーディオスレッドも確実に止めるためにイベントをセット
-        self.stop_event.set()
+        logger.info("画面録画が終了しました。オーディオスレッドの停止を試みます...")
+        self.stop_event.set()  # オーディオスレッドに停止を通知
 
-        # オーディオスレッドがキューの書き込みを終えるのを待つ
-        # is_alive() チェックは必須 (既に終了している場合があるため)
-        if self.audio_recording_thread and self.audio_recording_thread.is_alive():
-            logger.debug("オーディオスレッドが終了するのを待機中...")
-            # join() でスレッドの終了を待つ。タイムアウトを設定。
-            self.audio_recording_thread.join(timeout=5.0)
-            # タイムアウト後もまだ生きていたら警告表示
-            if self.audio_recording_thread.is_alive():
-                logger.warning("警告: オーディオスレッドの結合がタイムアウトしました。")
+        # --- 修正: 両方のオーディオスレッドの終了を待つ ---
+        threads_to_join = []
+        if self.mic_audio_thread:
+            threads_to_join.append(self.mic_audio_thread)
+        if self.sys_audio_thread:
+            threads_to_join.append(self.sys_audio_thread)
 
-        # 後処理（音声変換、一時ファイル削除、将来的にはマージ）を実行
+        if threads_to_join:
+            logger.debug(f"{len(threads_to_join)} 個のオーディオスレッドの終了を待機します...")
+            for t in threads_to_join:
+                if t.is_alive():  # スレッドが開始していれば join を試みる
+                    # logger.debug(f"オーディオスレッド ({t.name}) が終了するのを待機中...")
+                    t.join(timeout=5.0)
+                    if t.is_alive():
+                        logger.warning(
+                            f"警告: オーディオスレッド ({t.name}) の結合がタイムアウトしました。"
+                        )
+                else:
+                    logger.debug(f"オーディオスレッド ({t.name}) はすでに終了しています。")
+        else:
+            logger.debug("待機対象のオーディオスレッドはありませんでした。")
+        # --- ここまで修正 ---
+
+        # 後処理（FFmpegマージ、一時ファイル削除）を実行
+        # この時点で self.mic_audio_success と self.sys_audio_success が設定されているはず
         self._process_output()
 
         logger.info("レコーダーが終了しました。")
